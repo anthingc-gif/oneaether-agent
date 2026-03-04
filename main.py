@@ -41,6 +41,7 @@ credentials: Dict[str, Any] = {
     "agent": {
         "enabled":        os.getenv("AGENT_ENABLED", "true").lower() == "true",
         "anthropic_key":  os.getenv("ANTHROPIC_API_KEY", ""),
+        "openai_key":     os.getenv("OPENAI_API_KEY", ""),
     }
 }
 
@@ -51,7 +52,12 @@ conversation_memory: Dict[str, List[Dict]] = {}
 async def lifespan(app: FastAPI):
     logger.info("oneaether.ai starting on port %s", os.getenv("PORT", 8000))
     logger.info("AI Agent: %s", "ENABLED" if credentials["agent"]["enabled"] else "DISABLED")
-    logger.info("Claude API: %s", "configured" if credentials["agent"]["anthropic_key"] else "NOT SET - using rule-based fallback")
+    if credentials["agent"]["anthropic_key"]:
+        logger.info("AI Provider: Claude (Anthropic)")
+    elif credentials["agent"]["openai_key"]:
+        logger.info("AI Provider: OpenAI GPT-4o-mini")
+    else:
+        logger.info("AI Provider: rule-based fallback (no API key set)")
     yield
     logger.info("oneaether.ai shutting down")
 
@@ -228,41 +234,44 @@ def extract_order_number(text: str) -> Optional[str]:
 
 # ─── Claude AI Intent Analysis ────────────────────────────────────────────────
 
-async def analyze_with_claude(
+async def analyze_with_ai(
     message_text: str,
     sender_name: str,
     customer_name: Optional[str],
     recent_context: List[Dict],
 ) -> Dict:
     """
-    Use Claude API to deeply understand the message intent and extract structured data.
-    Falls back to rule-based if API key not set.
+    Use AI (Claude or OpenAI) to understand message intent.
+    Falls back to rule-based if no API key is set.
+    Priority: Anthropic > OpenAI > rule-based
     """
-    api_key = credentials["agent"].get("anthropic_key", "")
-    if not api_key:
-        # Fallback to rule-based
+    anthropic_key = credentials["agent"].get("anthropic_key", "")
+    openai_key    = credentials["agent"].get("openai_key", "")
+
+    # Rule-based fallback function
+    def rule_based():
         intent, confidence = detect_intent_rules(message_text)
-        items = extract_order_items(message_text)
-        order_num = extract_order_number(message_text)
         return {
             "intent": intent,
             "confidence": confidence,
-            "items": items,
-            "order_number": order_num,
+            "items": extract_order_items(message_text),
+            "order_number": extract_order_number(message_text),
             "summary": f"Detected {intent} with {confidence:.0%} confidence",
-            "suggested_reply": None,  # Will be generated separately
+            "suggested_reply": None,
             "method": "rule-based",
         }
 
-    # Build context string
+    if not anthropic_key and not openai_key:
+        return rule_based()
+
+    # Build shared prompt content
     context_str = ""
     if recent_context:
         context_str = "\n".join([f"{m['role'].upper()}: {m['text']}" for m in recent_context[-4:]])
 
     system_prompt = """You are an AI agent for a B2B food distribution company using WhatsApp for orders.
-Your job is to analyze incoming WhatsApp messages and extract structured intent and order data.
-
-Always respond with valid JSON only, no markdown, no explanation.
+Analyze incoming WhatsApp messages and extract structured intent and order data.
+Always respond with valid JSON only — no markdown, no explanation.
 
 Intent types:
 - NEW_ORDER: Customer wants to place a new order
@@ -278,13 +287,13 @@ JSON response format:
   "intent": "NEW_ORDER",
   "confidence": 0.95,
   "items": [{"name": "product name", "qty": 5, "uom": "boxes"}],
-  "order_number": "B2B-12345-001 or null",
-  "summary": "one sentence summary of what customer wants",
-  "suggested_reply": "a friendly, professional reply to send back to the customer",
-  "urgency": "normal | urgent | critical"
+  "order_number": null,
+  "summary": "one sentence summary",
+  "suggested_reply": "friendly professional reply to send back",
+  "urgency": "normal"
 }"""
 
-    user_prompt = f"""Analyze this WhatsApp message from a B2B customer:
+    user_prompt = f"""Analyze this WhatsApp message:
 
 Sender: {sender_name}
 Customer account: {customer_name or 'Unknown'}
@@ -293,51 +302,56 @@ Recent conversation:
 
 Latest message: "{message_text}"
 
-Extract the intent and any order details. Write the suggested_reply in a friendly, professional tone.
-If it's a new order, confirm the items you understood and ask for delivery date.
-If it's an amendment, confirm what change you understood.
-If it's a cancellation, confirm the order number and ask for confirmation.
-If it's an enquiry, answer helpfully (you don't have product data, so offer to check).
-"""
+Extract the intent and order details. Write a friendly, professional suggested_reply."""
 
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": "claude-haiku-4-5-20251001",
-                    "max_tokens": 600,
-                    "system": system_prompt,
-                    "messages": [{"role": "user", "content": user_prompt}],
-                }
-            )
-            data = resp.json()
-            text = data["content"][0]["text"].strip()
-            # Strip markdown fences if present
-            text = re.sub(r'^```json\s*|\s*```$', '', text.strip())
-            result = json.loads(text)
-            result["method"] = "claude-ai"
-            return result
-    except Exception as e:
-        logger.error(f"Claude API error: {e}")
-        # Fallback to rule-based
-        intent, confidence = detect_intent_rules(message_text)
-        items = extract_order_items(message_text)
-        return {
-            "intent": intent,
-            "confidence": confidence,
-            "items": items,
-            "order_number": extract_order_number(message_text),
-            "summary": f"{intent} detected",
-            "suggested_reply": None,
-            "method": "rule-based-fallback",
-        }
+    # ── Try Anthropic Claude ──
+    if anthropic_key:
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={"x-api-key": anthropic_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                    json={"model": "claude-haiku-4-5-20251001", "max_tokens": 600,
+                          "system": system_prompt, "messages": [{"role": "user", "content": user_prompt}]},
+                )
+                data = resp.json()
+                text = data["content"][0]["text"].strip()
+                text = re.sub(r'^```json\s*|\s*```$', '', text.strip())
+                result = json.loads(text)
+                result["method"] = "claude-ai"
+                return result
+        except Exception as e:
+            logger.error(f"Claude API error: {e} — trying OpenAI fallback")
 
+    # ── Try OpenAI ──
+    if openai_key:
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"},
+                    json={
+                        "model": "gpt-4o-mini",
+                        "max_tokens": 600,
+                        "temperature": 0.2,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user",   "content": user_prompt},
+                        ],
+                        "response_format": {"type": "json_object"},
+                    },
+                )
+                data = resp.json()
+                text = data["choices"][0]["message"]["content"].strip()
+                result = json.loads(text)
+                result["method"] = "openai-gpt4o-mini"
+                return result
+        except Exception as e:
+            logger.error(f"OpenAI API error: {e} — falling back to rule-based")
+
+    return rule_based()
+
+# ─── Intent Handlers ────────────────────────────────────────────────────────
 # ─── Intent Handlers ──────────────────────────────────────────────────────────
 
 async def handle_new_order(analysis: Dict, sender_name: str, chat_id: str) -> str:
@@ -509,7 +523,7 @@ async def process_incoming_message(
 
     # Analyze intent
     logger.info(f"[AGENT] Analyzing: '{text[:80]}' from {sender_name}")
-    analysis = await analyze_with_claude(text, sender_name, customer_name, context)
+    analysis = await analyze_with_ai(text, sender_name, customer_name, context)
     intent = analysis.get("intent", "UNKNOWN")
     confidence = analysis.get("confidence", 0)
     logger.info(f"[AGENT] Intent: {intent} ({confidence:.0%}) via {analysis.get('method','?')}")
@@ -568,7 +582,11 @@ async def health():
         "snc_configured":   bool(credentials["snc"].get("access_token")),
         "whapi_configured": bool(credentials["whapi"].get("token")),
         "agent_enabled":    credentials["agent"]["enabled"],
-        "ai_model":         "claude-haiku" if credentials["agent"]["anthropic_key"] else "rule-based",
+        "ai_model": (
+            "claude-haiku" if credentials["agent"]["anthropic_key"]
+            else "gpt-4o-mini" if credentials["agent"]["openai_key"]
+            else "rule-based"
+        ),
     }
 
 @app.get("/agent/status")
@@ -576,7 +594,11 @@ async def agent_status():
     return {
         "enabled":       credentials["agent"]["enabled"],
         "ai_powered":    bool(credentials["agent"]["anthropic_key"]),
-        "model":         "claude-haiku-4-5" if credentials["agent"]["anthropic_key"] else "rule-based",
+        "model": (
+            "claude-haiku-4-5" if credentials["agent"]["anthropic_key"]
+            else "gpt-4o-mini" if credentials["agent"]["openai_key"]
+            else "rule-based"
+        ),
         "active_chats":  len(conversation_memory),
         "intents":       list(INTENTS.keys()),
     }
@@ -596,7 +618,7 @@ async def test_agent(request: Request):
     text = body.get("message", "I want to order 5 boxes of chicken karaage")
     sender = body.get("sender", "Test User")
 
-    analysis = await analyze_with_claude(text, sender, None, [])
+    analysis = await analyze_with_ai(text, sender, None, [])
     intent = analysis.get("intent", "UNKNOWN")
 
     # Generate reply
@@ -625,6 +647,8 @@ async def save_credentials(payload: CredentialsPayload):
             credentials["agent"]["enabled"] = payload.agent["enabled"] == "true"
         if "anthropic_key" in payload.agent and payload.agent["anthropic_key"]:
             credentials["agent"]["anthropic_key"] = payload.agent["anthropic_key"]
+        if "openai_key" in payload.agent and payload.agent["openai_key"]:
+            credentials["agent"]["openai_key"] = payload.agent["openai_key"]
     return {"status": "ok"}
 
 @app.get("/credentials/status")
@@ -632,7 +656,7 @@ async def credentials_status():
     return {
         "snc":   {"api_url": credentials["snc"].get("api_url",""), "company_id": credentials["snc"].get("company_id",""), "authenticated": bool(credentials["snc"].get("access_token"))},
         "whapi": {"base_url": credentials["whapi"].get("base_url",""), "channel_id": credentials["whapi"].get("channel_id",""), "configured": bool(credentials["whapi"].get("token"))},
-        "agent": {"enabled": credentials["agent"]["enabled"], "ai_powered": bool(credentials["agent"]["anthropic_key"])},
+        "agent": {"enabled": credentials["agent"]["enabled"], "ai_powered": bool(credentials["agent"]["anthropic_key"] or credentials["agent"]["openai_key"])},
     }
 
 @app.post("/process-message")
