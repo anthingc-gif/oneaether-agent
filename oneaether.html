@@ -1105,10 +1105,10 @@ function WhatsAppScreen({ conn = {} }) {
           console.warn("No customers in DB — trigger a sync first");
         }
         setCustomers(list.map(c => ({
-          id:         c.customer_id || c.store_id,
-          store_id:   c.store_id || "",
+          id:         c.customer_id || c.store_id || c.id,
+          store_id:   c.store_id || c.customer_id || c.id,
           branch_id:  c.branch_id || "",
-          label:      c.customer_name || c.store || "Unknown",
+          label:      c.customer_name || c.store || c.name || "Unknown",
           branch:     c.branch_name || "Main Branch",
           branches:   c.branch_id ? [{branch_id: c.branch_id, branch_name: c.branch_name || "Main Branch"}] : [],
         })));
@@ -1466,13 +1466,13 @@ function WhatsAppScreen({ conn = {} }) {
                     <label style={{fontSize:11,color:"var(--text2)",display:"block",marginBottom:4}}>CUSTOMER</label>
                     <select className="form-input" value={(assignments[assignChat.id] && assignments[assignChat.id].store_id)||""}
                       onChange={e=>{
-                        const c = (customers||[]).find(x=>x.store_id===e.target.value);
+                        const c = (customers||[]).find(x=>x.id===e.target.value);
                         if(c) {
                           saveAssignment(assignChat.id,null,"customer",c.label,{store_id:c.store_id,customer_id:c.id,branch_id:c.branch_id,branch:c.branch,branches:c.branches});
                         }
                       }}>
                       <option value="">— Select Customer —</option>
-                      {(customers||[]).map(c=><option key={c.id} value={c.store_id}>{c.label}</option>)}
+                      {(customers||[]).map(c=><option key={c.id} value={c.id}>{c.label}</option>)}
                     </select>
                   </div>
                   <div>
@@ -1506,11 +1506,11 @@ function WhatsAppScreen({ conn = {} }) {
                     </div>
                     <div style={{display:"flex",gap:8,marginTop:8,justifyContent:"center"}}>
                       <select className="form-input" style={{width:200,fontSize:11}} onChange={e=>{
-                        const c=(customers||[]).find(x=>x.store_id===e.target.value);
+                        const c=(customers||[]).find(x=>x.id===e.target.value);
                         if(c) saveAssignment(assignChat.id,null,"customer",c.label,{store_id:c.store_id,branch_id:c.branch_id,branch:c.branch});
                       }}>
                         <option value="">— Assign whole group —</option>
-                        {(customers||[]).map(c=><option key={c.id} value={c.store_id}>{c.label}</option>)}
+                        {(customers||[]).map(c=><option key={c.id} value={c.id}>{c.label}</option>)}
                       </select>
                     </div>
                   </div>
@@ -1526,11 +1526,11 @@ function WhatsAppScreen({ conn = {} }) {
                     </div>
                     <select className="form-input" style={{fontSize:11,padding:"5px 8px"}} value={(assignments[m.id] && assignments[m.id].store_id)||""}
                       onChange={e=>{
-                        const c=(customers||[]).find(x=>x.store_id===e.target.value);
+                        const c=(customers||[]).find(x=>x.id===e.target.value);
                         if(c) saveAssignment(null,m.id,"customer",c.label,{store_id:c.store_id,branches:c.branches});
                       }}>
                       <option value="">— Customer —</option>
-                      {(customers||[]).map(c=><option key={c.id} value={c.store_id}>{c.label}</option>)}
+                      {(customers||[]).map(c=><option key={c.id} value={c.id}>{c.label}</option>)}
                     </select>
                     <select className="form-input" style={{fontSize:11,padding:"5px 8px"}} value={assignments[m.id] && assignments[m.id].branch_id||""}
                       onChange={e=>{
