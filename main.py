@@ -270,10 +270,25 @@ def snc_headers():
     return {"Authorization": f"Bearer {credentials['snc'].get('access_token','')}", "Content-Type": "application/json"}
 
 def snc_base():
+    # user_id is required by SNC — decode from JWT token if not set
+    user_id  = credentials["snc"].get("user_id","")
+    username = credentials["snc"].get("username","")
+    if not user_id:
+        try:
+            import base64, json as _json
+            token = credentials["snc"].get("access_token","")
+            payload = token.split(".")[1]
+            payload += "=" * (4 - len(payload) % 4)
+            decoded = _json.loads(base64.b64decode(payload))
+            username = username or decoded.get("username","")
+            # SNC JWT doesn't include user_id directly — extract from username
+            logger.warning("user_id missing from credentials — JWT: %s", decoded)
+        except Exception:
+            pass
     return {
         "company_id":   credentials["snc"].get("company_id",""),
-        "user_id":      credentials["snc"].get("user_id",""),
-        "username":     credentials["snc"].get("username",""),
+        "user_id":      user_id,
+        "username":     username,
         "timezone":     credentials["snc"].get("timezone","Asia/Singapore"),
         "request_from": "WEB",
     }
@@ -733,6 +748,57 @@ async def serve_frontend():
     if html_file.exists(): return HTMLResponse(content=html_file.read_text())
     return HTMLResponse(content="<h2>✓ oneaether.ai running</h2>")
 
+@app.get("/resolve-user")
+async def resolve_user():
+    """Fetch user_id from SNC using the current token — call this after setting token."""
+    api_url = credentials["snc"].get("api_url","")
+    token   = credentials["snc"].get("access_token","")
+    company = credentials["snc"].get("company_id","")
+    if not token:
+        raise HTTPException(status_code=400, detail="No token set")
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            # Try to get user profile
+            resp = await client.get(f"{api_url}/user/profile",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+            logger.info("resolve_user profile → HTTP %s", resp.status_code)
+            if resp.status_code == 200:
+                data = resp.json()
+                user_id  = data.get("user_id") or data.get("id") or data.get("_id","")
+                username = data.get("username") or data.get("email","")
+                if user_id:
+                    credentials["snc"]["user_id"]  = user_id
+                    credentials["snc"]["username"] = username
+                    db_set_credential("snc_user_id",  user_id)
+                    db_set_credential("snc_username", username)
+                    return {"user_id": user_id, "username": username, "source": "profile"}
+
+            # Fallback: try whoami or me endpoint
+            for ep in ["/whoami", "/me", "/user/me"]:
+                resp2 = await client.get(f"{api_url}{ep}",
+                    headers={"Authorization": f"Bearer {token}"})
+                if resp2.status_code == 200:
+                    data2 = resp2.json()
+                    user_id = data2.get("user_id") or data2.get("id","")
+                    if user_id:
+                        credentials["snc"]["user_id"] = user_id
+                        db_set_credential("snc_user_id", user_id)
+                        return {"user_id": user_id, "source": ep}
+
+            # Last resort: decode JWT
+            try:
+                import base64 as _b64, json as _json
+                parts = token.split(".")
+                pad = parts[1] + "=" * (4 - len(parts[1]) % 4)
+                decoded = _json.loads(_b64.b64decode(pad))
+                logger.info("JWT payload: %s", decoded)
+                return {"jwt_payload": decoded, "note": "user_id not in JWT — set manually"}
+            except Exception as e:
+                return {"error": str(e)}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 @app.get("/health")
 async def health():
     db = get_db()
@@ -754,10 +820,26 @@ async def save_credentials(payload: CredentialsPayload):
         for k,v in payload.snc.items():
             if v: credentials["snc"][k] = v
         if payload.snc.get("api_url"):      db_set_credential("snc_api_url",    payload.snc["api_url"])
-        if payload.snc.get("access_token"): db_set_credential("snc_token",      payload.snc["access_token"])
-        if payload.snc.get("user_id"):      db_set_credential("snc_user_id",    payload.snc["user_id"])
-        if payload.snc.get("username"):     db_set_credential("snc_username",   payload.snc["username"])
         if payload.snc.get("company_id"):   db_set_credential("snc_company_id", payload.snc["company_id"])
+        if payload.snc.get("username"):     db_set_credential("snc_username",   payload.snc["username"])
+        if payload.snc.get("user_id"):
+            db_set_credential("snc_user_id", payload.snc["user_id"])
+        # Auto-extract username from JWT if not provided
+        token = payload.snc.get("access_token","")
+        if token:
+            db_set_credential("snc_token", token)
+            try:
+                import base64 as _b64, json as _json
+                parts = token.split(".")
+                if len(parts) == 3:
+                    pad = parts[1] + "=" * (4 - len(parts[1]) % 4)
+                    decoded = _json.loads(_b64.b64decode(pad))
+                    if decoded.get("username") and not credentials["snc"].get("username"):
+                        credentials["snc"]["username"] = decoded["username"]
+                        db_set_credential("snc_username", decoded["username"])
+                    logger.info("JWT decoded: username=%s company=%s", decoded.get("username"), decoded.get("company_id"))
+            except Exception as e:
+                logger.warning("JWT decode failed: %s", e)
     if payload.whapi:
         for k,v in payload.whapi.items():
             if v: credentials["whapi"][k] = v
@@ -794,8 +876,8 @@ async def debug_sync_test():
         async with httpx.AsyncClient(timeout=30) as client:
             payload = {
                 "company_id":   company,
-                "user_id":      user_id,
-                "username":     credentials["snc"].get("username",""),
+                "user_id":      effective_user_id,
+                "username":     effective_username,
                 "timezone":     credentials["snc"].get("timezone","Asia/Singapore"),
                 "request_from": "WEB",
                 "data": {
