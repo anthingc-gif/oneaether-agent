@@ -354,28 +354,254 @@ Extract the intent and order details. Write a friendly, professional suggested_r
 # ─── Intent Handlers ────────────────────────────────────────────────────────
 # ─── Intent Handlers ──────────────────────────────────────────────────────────
 
+async def lookup_products_for_items(items: List[Dict], relation_id: str = "") -> List[Dict]:
+    """Search SNC for each item by name and enrich with product IDs, price, UOM."""
+    enriched = []
+    for item in items:
+        result = await snc_call("/products/list", {"data": {"filter_by": {
+            "search_text": [item["name"]],
+            "search_on": ["name", "sku", "product_code"],
+            "confidence": 0.5, "exact_match": False,
+            "pagination": {"page_no": 1, "no_of_recs": 5, "sort_by": "cts", "order_by": False},
+            "view": "individual", "status": "Active",
+            "include_columns": ["name", "sku", "prices", "uom", "uom_id", "item_id", "tax_code", "tax_code_id", "tax_rate"],
+            "merged": True, "bundles": False,
+            **({"relation_id": relation_id} if relation_id else {}),
+        }}})
+        if result and result.get("result", {}).get("data"):
+            product = result["result"]["data"][0]
+            prices  = product.get("prices", [])
+            price   = prices[0].get("price", 0) if prices else 0
+            enriched.append({
+                **item,
+                "item_id":      product.get("item_id", ""),
+                "sku":          product.get("sku", ""),
+                "full_name":    product.get("name", item["name"]),
+                "uom":          product.get("uom", item.get("uom", "unit")),
+                "uom_id":       product.get("uom_id", ""),
+                "base_uom":     product.get("uom", item.get("uom", "unit")),
+                "base_uom_id":  product.get("uom_id", ""),
+                "price":        price,
+                "tax_rate":     product.get("tax_rate", 9),
+                "tax_code":     product.get("tax_code", "SR9"),
+                "tax_code_id":  product.get("tax_code_id", ""),
+                "found":        True,
+            })
+        else:
+            enriched.append({**item, "found": False})
+    return enriched
+
+
+async def get_customer_info(chat_id: str) -> Optional[Dict]:
+    """Look up customer by WhatsApp chat_id."""
+    result = await snc_call("/whatsapp/contacts/get", {"data": {"filter_by": {
+        "phone_number": chat_id.replace("@s.whatsapp.net", "").replace("@g.us", ""),
+        "search_text":  "",
+        "exact_match":  False,
+    }}})
+    if result and result.get("result"):
+        r = result["result"]
+        if isinstance(r, list) and r:
+            return r[0]
+        if isinstance(r, dict):
+            return r
+    return None
+
+
+async def push_order_to_snc(
+    items: List[Dict],
+    customer_info: Dict,
+    delivery_date: str,
+    chat_id: str,
+    sender_name: str,
+) -> Optional[str]:
+    """
+    Create order in SNC. Returns order_number on success, None on failure.
+    Uses the exact payload format from Postman collection.
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    delivery = delivery_date or (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # Build item_info list
+    item_info = []
+    item_total = 0.0
+    tax_total  = 0.0
+
+    for it in items:
+        if not it.get("found") or not it.get("item_id"):
+            continue
+        qty        = it.get("qty", 1)
+        price      = it.get("price", 0)
+        tax_rate   = it.get("tax_rate", 9)
+        line_total = round(qty * price, 5)
+        tax_amt    = round(line_total * tax_rate / 100, 5)
+        item_total += line_total
+        tax_total  += tax_amt
+
+        item_info.append({
+            "item_id":              it["item_id"],
+            "name":                 it["full_name"],
+            "sku":                  it["sku"],
+            "tax_code":             it["tax_code"],
+            "tax_code_id":          it["tax_code_id"],
+            "tax_rate":             tax_rate,
+            "tax_amount":           tax_amt,
+            "uom":                  it["uom"],
+            "uom_id":               it["uom_id"],
+            "base_uom_id":          it["base_uom_id"],
+            "base_uom":             it["base_uom"],
+            "conversion_rate":      1,
+            "qty":                  qty,
+            "new_qty":              qty,
+            "actual_qty":           qty,
+            "total_order_qty":      0,
+            "price":                price,
+            "special_price_enabled":False,
+            "promotion_enabled":    False,
+            "promotion_info":       {"promotion_id":None,"name":None,"discount_type":None,"discount_value":None,"promotional_stock":None,"purchase_limit":None,"discount_amount":None},
+            "discount_info":        {"discount_type":"% Discount","discount_id":None,"discount_name":None,"deal_id":None,"deal_name":None,"discount":0,"discount_amount":0,"coupon_code":0},
+            "item_total":           line_total,
+            "adjusted_qty":         0, "available_qty": 0, "free": 0,
+            "is_offer_item":        False, "actual_is_offer_item": False,
+            "movement_info":        [], "new_movement_info":       [],
+            "exchange":             False, "damaged": False, "deleted": False,
+            "auto_assign":          False, "picked": False, "packed": False,
+            "packed_qty":           0, "picked_qty": 0,
+            "has_catch_weight":     False, "cw_conversion": 1,
+            "cw_price":             price, "cw_qty": qty,
+            "actual_sku":           it["sku"],
+            "actual_name":          it["full_name"],
+            "actual_uom":           it["uom"],
+            "actual_uom_id":        it["uom_id"],
+            "actual_base_uom_id":   it["base_uom_id"],
+            "actual_base_uom":      it["base_uom"],
+            "actual_conversion_rate":1,
+            "actual_qty_for_return":qty,
+            "actual_price":         price,
+            "drop_shipping":        False,
+            "drop_shipping_from_product":"No Drop Ship",
+            "tags":                 [],
+        })
+
+    if not item_info:
+        return None
+
+    total_amount = round(item_total + tax_total, 5)
+    username     = credentials["snc"].get("username", "")
+    user_id      = credentials["snc"].get("user_id", "")
+    company_id   = credentials["snc"].get("company_id", "mindmasters")
+
+    # First check chat_assignments (set via UI), then fall back to customer_info from SNC
+    assigned   = chat_assignments.get(chat_id, {})
+    store_id   = assigned.get("store_id")   or (customer_info.get("store_id", "")   if customer_info else "")
+    store      = assigned.get("customer")   or (customer_info.get("store", "")      if customer_info else "")
+    branch_id  = assigned.get("branch_id")  or (customer_info.get("branch_id", "")  if customer_info else "")
+    branch_name= assigned.get("branch")     or (customer_info.get("branch_name", "Main Branch") if customer_info else "Main Branch")
+    del_addr_id= customer_info.get("delivery_address_id", "") if customer_info else ""
+    del_addr   = customer_info.get("delivery_address_info", {}) if customer_info else {}
+    bill_addr_id=customer_info.get("billing_address_id", "") if customer_info else ""
+    bill_addr  = customer_info.get("billing_address_info", {}) if customer_info else {}
+
+    order_data = {
+        "company_id":    company_id,
+        "source":        "B2B",
+        "platform":      "Whatsapp",
+        "store_id":      store_id,
+        "store":         store,
+        "branch_id":     branch_id,
+        "branch_name":   branch_name,
+        "currency":      "SGD",
+        "items_count":   len(item_info),
+        "order_status":  "Pending",
+        "paid_status":   "Pending",
+        "delivery_type": "Delivery",
+        "delivery_date": delivery,
+        "item_total":    item_total,
+        "tax_amount":    tax_total,
+        "total_amount":  total_amount,
+        "created_by":    username,
+        "updated_by":    username,
+        "created_by_id": user_id,
+        "user_id":       user_id,
+        "user_name":     username,
+        "item_info":     item_info,
+        "discount_info": {"discount_type":"% Discount","discount":0,"discount_amount":0,"discount_id":None,"discount_name":None,"deal_id":None,"deal_name":None,"coupon_code":None},
+        "coupon_info":   {"discount_type":"% Discount","discount":0,"discount_amount":0,"discount_id":None,"discount_name":None,"deal_id":None,"deal_name":None,"coupon_code":None},
+        "free_shipping": False,
+        "payment_info":  [],
+        "applied_credit_notes": [],
+        "advance_amount":0,
+        "delivery_address_id":   del_addr_id,
+        "delivery_address_info": del_addr,
+        "billing_address_id":    bill_addr_id,
+        "billing_address_info":  bill_addr,
+        "delivery_charges":      0,
+        "tax_inclusive":         False,
+        "installation_info":     {"installation":False,"installation_date":None,"installation_charges":0},
+        "whatsapp_contact_id":   chat_id,
+    }
+
+    result = await snc_call("/b2b/order/save", {"data": order_data})
+    if result:
+        order_num = result.get("result", {}).get("order_number") or result.get("order_number")
+        logger.info(f"Order created: {order_num}")
+        return order_num
+    return None
+
+
 async def handle_new_order(analysis: Dict, sender_name: str, chat_id: str) -> str:
-    items = analysis.get("items", [])
-    if analysis.get("suggested_reply"):
-        return analysis["suggested_reply"]
+    items     = analysis.get("items", [])
+    confirmed = analysis.get("confirmed", False)
 
     if not items:
         return (
             f"Hi {sender_name}! 🛒 I'd like to help you place an order.\n\n"
-            "Could you please specify:\n"
-            "• *Product name*\n"
-            "• *Quantity & unit* (e.g. 5 boxes, 10 pcs)\n"
-            "• *Delivery date*\n\n"
-            "Example: _I want 3 boxes chicken karaage and 10 pcs mushroom for delivery tomorrow_"
+            f"Please tell me:\n• *Product name*\n• *Quantity & unit* (e.g. 5 boxes)\n• *Delivery date*\n\n"
+            f"Example: _5 boxes chicken karaage, delivery tomorrow_"
         )
 
-    item_lines = "\n".join([f"  • {i['name']} × {i['qty']} {i['uom']}" for i in items])
-    return (
-        f"Got it {sender_name}! 🛒 Let me confirm your order:\n\n"
-        f"{item_lines}\n\n"
-        f"✅ Please reply *CONFIRM* to place this order, or let me know if anything needs to change.\n"
-        f"📅 What delivery date would you like?"
-    )
+    # Step 1: Look up products in SNC
+    enriched = await lookup_products_for_items(items)
+    found    = [i for i in enriched if i.get("found")]
+    missing  = [i for i in enriched if not i.get("found")]
+
+    if not found:
+        item_names = ", ".join([i["name"] for i in items])
+        return (
+            f"I couldn't find these products in our catalogue: *{item_names}*\n\n"
+            f"Please check the product names and try again, or type *products* to browse."
+        )
+
+    # Step 2: Show confirmation with found products + prices
+    lines = []
+    for i in found:
+        price_str = f" @ ${i['price']:.2f}/{i['uom']}" if i.get("price") else ""
+        lines.append(f"  • *{i['full_name']}* × {i['qty']} {i['uom']}{price_str}")
+
+    total = sum(i.get("price", 0) * i.get("qty", 1) for i in found)
+
+    msg = f"Got it {sender_name}! 🛒 Here's your order summary:\n\n"
+    msg += "\n".join(lines)
+    if missing:
+        msg += f"\n\n⚠️ Not found: {', '.join([i['name'] for i in missing])}"
+    if total > 0:
+        msg += f"\n\n💰 Estimated total: *${total:.2f}* (excl. tax)"
+    msg += f"\n\n📅 Delivery date: *{analysis.get('delivery_date', 'tomorrow')}*"
+    msg += f"\n\n✅ Reply *CONFIRM* to place this order\n❌ Reply *CANCEL* to abort"
+
+    # Store pending order in conversation memory
+    conversation_memory[chat_id] = conversation_memory.get(chat_id, [])
+    conversation_memory[chat_id].append({
+        "role": "agent",
+        "text": msg,
+        "pending_order": {
+            "items": enriched,
+            "delivery_date": analysis.get("delivery_date", ""),
+        }
+    })
+
+    return msg
+
 
 async def handle_amend_order(analysis: Dict, sender_name: str, chat_id: str) -> str:
     if analysis.get("suggested_reply"):
@@ -537,7 +763,40 @@ async def process_incoming_message(
     emoji = intent_config.get("emoji", "💬")
     label = intent_config.get("label", intent)
 
-    if intent == "NEW_ORDER":
+    # ── Handle CONFIRM / YES — execute pending order ──
+    if text.strip().upper() in ("CONFIRM", "YES", "YEP", "OK", "CONFIRMED"):
+        mem = conversation_memory.get(chat_id, [])
+        pending = next((m.get("pending_order") for m in reversed(mem) if m.get("pending_order")), None)
+        if pending:
+            await whapi_send(chat_id, f"⏳ Placing your order now, {sender_name}...")
+            customer_info = await get_customer_info(chat_id)
+            order_num = await push_order_to_snc(
+                items=pending["items"],
+                customer_info=customer_info,
+                delivery_date=pending.get("delivery_date", ""),
+                chat_id=chat_id,
+                sender_name=sender_name,
+            )
+            if order_num:
+                reply = (
+                    f"✅ Order placed successfully, {sender_name}!\n\n"
+                    f"📋 Order Number: *{order_num}*\n"
+                    f"📅 Delivery: {pending.get('delivery_date', 'as requested')}\n\n"
+                    f"You'll receive a confirmation shortly. Type *orders* to track your order."
+                )
+                # Clear pending order
+                for m in mem:
+                    m.pop("pending_order", None)
+            else:
+                reply = (
+                    f"⚠️ I couldn't create the order automatically, {sender_name}.\n\n"
+                    f"Please contact your sales rep to place this order manually.\n"
+                    f"Reference: {', '.join([i['full_name'] + ' x' + str(i['qty']) for i in pending['items'] if i.get('found')])}"
+                )
+        else:
+            reply = f"No pending order found, {sender_name}. Please place a new order first."
+
+    elif intent == "NEW_ORDER":
         reply = await handle_new_order(analysis, sender_name, chat_id)
     elif intent == "AMEND_ORDER":
         reply = await handle_amend_order(analysis, sender_name, chat_id)
@@ -573,6 +832,30 @@ async def serve_frontend():
     if html_file.exists():
         return HTMLResponse(content=html_file.read_text())
     return HTMLResponse(content="<h2 style='font-family:sans-serif;padding:40px'>✓ oneaether.ai backend running!</h2>")
+
+@app.get("/proxy/whapi/group/{chat_id}")
+async def proxy_whapi_group(chat_id: str):
+    """Fetch group info and participants from Whapi."""
+    base  = credentials["whapi"].get("base_url", "https://gate.whapi.cloud")
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            resp = await client.get(f"{base}/groups/{chat_id}", headers=whapi_headers())
+            return resp.json()
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=str(e))
+
+@app.post("/assignments")
+async def save_assignments(request: Request):
+    """Save chat→customer/branch assignments from the UI."""
+    body = await request.json()
+    new_assignments = body.get("assignments", {})
+    chat_assignments.update(new_assignments)
+    logger.info(f"Saved {len(new_assignments)} assignments")
+    return {"status": "ok", "total": len(chat_assignments)}
+
+@app.get("/assignments")
+async def get_assignments():
+    return {"assignments": chat_assignments}
 
 @app.get("/health")
 async def health():
@@ -771,44 +1054,28 @@ async def proxy_snc_login(request: Request):
 
     try:
         async with httpx.AsyncClient(timeout=20) as client:
-            # Try 1: form data (standard OAuth2)
+            # SNC encrypts credentials in the browser before sending.
+            # We send them as-is (already encrypted by the frontend or as plain text).
+            # SNC enterprise uses Fernet encryption on the frontend — we pass through whatever the user provides.
             resp = await client.post(login_url, data=fd)
-            logger.info(f"SNC login attempt 1 (form): {resp.status_code}")
-            logger.info(f"SNC response body: {resp.text[:500]}")
-
-            # Try 2: if 500, try JSON body instead
-            if resp.status_code == 500:
-                logger.info("Form data got 500 — trying JSON body")
-                resp = await client.post(login_url,
-                    json={"username": username, "password": password, "grant_type": "password"},
-                    headers={"Content-Type": "application/json"})
-                logger.info(f"SNC login attempt 2 (json): {resp.status_code}")
-                logger.info(f"SNC response body: {resp.text[:500]}")
-
-            # Try 3: if still failing, try without grant_type
-            if resp.status_code in (400, 422, 500):
-                logger.info("Trying without grant_type")
-                resp = await client.post(login_url,
-                    data={"username": username, "password": password})
-                logger.info(f"SNC login attempt 3 (minimal): {resp.status_code}")
-                logger.info(f"SNC response body: {resp.text[:500]}")
+            logger.info(f"SNC login status: {resp.status_code}")
+            logger.info(f"SNC login body: {resp.text[:500]}")
 
             try:
                 data = resp.json()
             except Exception:
                 data = {"raw": resp.text}
 
-            logger.info(f"SNC final status={resp.status_code} has_token={bool(data.get('access_token'))}")
-
             if resp.status_code not in (200, 201):
-                detail = data.get("detail") or data.get("message") or data.get("error") or f"SNC returned {resp.status_code}: {resp.text[:200]}"
+                detail = data.get("detail") or data.get("message") or data.get("error") or f"SNC returned {resp.status_code}: {resp.text[:300]}"
                 raise HTTPException(status_code=resp.status_code, detail=detail)
 
             if data.get("access_token"):
-                credentials["snc"]["api_url"]     = api_url
-                credentials["snc"]["access_token"] = data["access_token"]
-                credentials["snc"]["user_id"]      = data.get("user_id", "")
-                credentials["snc"]["username"]     = username
+                credentials["snc"]["api_url"]      = api_url
+                credentials["snc"]["access_token"]  = data["access_token"]
+                credentials["snc"]["user_id"]       = data.get("user_id", "")
+                credentials["snc"]["username"]      = username
+                logger.info(f"SNC login SUCCESS — user_id={data.get('user_id')}")
             return data
     except HTTPException:
         raise
