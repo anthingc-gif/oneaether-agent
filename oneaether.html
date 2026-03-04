@@ -1294,14 +1294,22 @@ function ConnectScreen({ defaultTab = "erp", conn, setConn }) {
       let data = null;
       const _agUrl = (conn.agentUrl || window.AGENT_URL || "").replace(/\/+$/, "");
 
-      // Always go via Railway backend proxy (avoids CORS completely)
+      // SNC encrypts credentials on their frontend using Fernet encryption.
+      // We must send the already-encrypted values from the Postman collection,
+      // OR send plain text and let backend handle it.
+      // The erpUsername/erpPassword fields accept EITHER plain text OR pre-encrypted Fernet tokens.
       if (_agUrl) {
         console.log("Logging in via backend proxy:", _agUrl);
         try {
           const proxyRes = await fetch(`${_agUrl}/proxy/snc/login`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ api_url: loginUrl, username: erpUsername, password: erpPassword })
+            body: JSON.stringify({
+              api_url:  loginUrl,
+              username: erpUsername,
+              password: erpPassword,
+              raw_mode: true   // tell backend to pass credentials as-is
+            })
           });
           const proxyData = await proxyRes.json();
           if (!proxyRes.ok) throw new Error(proxyData.detail || `HTTP ${proxyRes.status}`);
@@ -1311,8 +1319,7 @@ function ConnectScreen({ defaultTab = "erp", conn, setConn }) {
           throw new Error(`Login failed: ${proxyErr.message}`);
         }
       } else {
-        // No backend URL set — try direct (may fail due to CORS)
-        console.warn("No backend URL set — trying direct (may fail due to CORS)");
+        console.warn("No backend URL set — trying direct");
         try {
           const res = await fetch(loginUrl, { method: "POST", body: fd });
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -1472,6 +1479,30 @@ function ConnectScreen({ defaultTab = "erp", conn, setConn }) {
                 {erpOk && (
                   <button className="btn btn-ghost" onClick={() => setConn(c=>({...c, erpOk:false, erpToken:"", erpUserId:""}))}>Disconnect</button>
                 )}
+              </div>
+
+              {/* Direct token paste — bypass login if SNC encrypts credentials */}
+              <div style={{marginTop:16,padding:"14px",background:"#f59e0b10",border:"1px solid #f59e0b30",borderRadius:"var(--r2)"}}>
+                <div style={{fontSize:11,color:"var(--warn)",fontWeight:700,marginBottom:8}}>⚡ SHORTCUT — Paste Bearer Token directly</div>
+                <div style={{fontSize:11,color:"var(--text2)",marginBottom:8}}>
+                  If login keeps failing, get your token from SellnChill → Settings → API, or from your Postman collection (Authorization variable). Paste it below:
+                </div>
+                <div style={{display:"flex",gap:8}}>
+                  <input className="form-input" style={{flex:1,fontFamily:"monospace",fontSize:11}}
+                    placeholder="Paste Bearer token here (eyJ... or similar)"
+                    value={erpToken}
+                    onChange={e=>setErpToken(e.target.value.trim())}/>
+                  <button className="btn btn-primary btn-sm" disabled={!erpToken||!erpCompanyId}
+                    onClick={()=>{
+                      setErpOk(true);
+                      setErpLastSync(new Date().toLocaleString());
+                      const _ag = conn.agentUrl || window.AGENT_URL || "";
+                      if(_ag) fetch(_ag+"/credentials",{method:"POST",headers:{"Content-Type":"application/json"},
+                        body:JSON.stringify({snc:{api_url:erpApiUrl,access_token:erpToken,company_id:erpCompanyId,username:erpUsername,timezone:erpTimezone}})}).catch(()=>{});
+                    }}>
+                    ✓ Use Token
+                  </button>
+                </div>
               </div>
 
               {erpOk && (
