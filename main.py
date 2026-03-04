@@ -730,6 +730,19 @@ async def proxy_whapi_send(payload: SendMessagePayload):
         raise HTTPException(status_code=502, detail="Failed to send message")
     return {"status": "ok", "sent": True}
 
+@app.get("/proxy/snc/test-login")
+async def test_login_format(request: Request):
+    """Debug endpoint — shows exactly what we send to SNC."""
+    api_url = credentials["snc"].get("api_url") or "https://enterprise.sellnchill.com/api"
+    return {
+        "login_url":    f"{api_url}/login",
+        "method":       "POST",
+        "body_format":  "multipart/form-data",
+        "fields":       ["username", "password", "grant_type=password", "notification=false"],
+        "snc_api_url":  api_url,
+        "has_token":    bool(credentials["snc"].get("access_token")),
+    }
+
 @app.post("/proxy/snc/login")
 async def proxy_snc_login(request: Request):
     """
@@ -758,17 +771,44 @@ async def proxy_snc_login(request: Request):
 
     try:
         async with httpx.AsyncClient(timeout=20) as client:
+            # Try 1: form data (standard OAuth2)
             resp = await client.post(login_url, data=fd)
-            data = resp.json()
-            logger.info(f"SNC login response: {resp.status_code} — has_token={bool(data.get('access_token'))}")
+            logger.info(f"SNC login attempt 1 (form): {resp.status_code}")
+            logger.info(f"SNC response body: {resp.text[:500]}")
+
+            # Try 2: if 500, try JSON body instead
+            if resp.status_code == 500:
+                logger.info("Form data got 500 — trying JSON body")
+                resp = await client.post(login_url,
+                    json={"username": username, "password": password, "grant_type": "password"},
+                    headers={"Content-Type": "application/json"})
+                logger.info(f"SNC login attempt 2 (json): {resp.status_code}")
+                logger.info(f"SNC response body: {resp.text[:500]}")
+
+            # Try 3: if still failing, try without grant_type
+            if resp.status_code in (400, 422, 500):
+                logger.info("Trying without grant_type")
+                resp = await client.post(login_url,
+                    data={"username": username, "password": password})
+                logger.info(f"SNC login attempt 3 (minimal): {resp.status_code}")
+                logger.info(f"SNC response body: {resp.text[:500]}")
+
+            try:
+                data = resp.json()
+            except Exception:
+                data = {"raw": resp.text}
+
+            logger.info(f"SNC final status={resp.status_code} has_token={bool(data.get('access_token'))}")
+
             if resp.status_code not in (200, 201):
-                raise HTTPException(status_code=resp.status_code, detail=data.get("detail", f"SNC returned {resp.status_code}"))
-            # Store credentials in agent memory
+                detail = data.get("detail") or data.get("message") or data.get("error") or f"SNC returned {resp.status_code}: {resp.text[:200]}"
+                raise HTTPException(status_code=resp.status_code, detail=detail)
+
             if data.get("access_token"):
-                credentials["snc"]["api_url"]      = api_url
-                credentials["snc"]["access_token"]  = data["access_token"]
-                credentials["snc"]["user_id"]       = data.get("user_id", "")
-                credentials["snc"]["username"]      = username
+                credentials["snc"]["api_url"]     = api_url
+                credentials["snc"]["access_token"] = data["access_token"]
+                credentials["snc"]["user_id"]      = data.get("user_id", "")
+                credentials["snc"]["username"]     = username
             return data
     except HTTPException:
         raise
