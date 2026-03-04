@@ -737,6 +737,54 @@ async def credentials_status():
     }
 
 # ─── Sync routes ──────────────────────────────────────────────────────────────
+@app.get("/debug/sync-test")
+async def debug_sync_test():
+    """Test SNC connection and customer fetch — returns raw response."""
+    api_url = credentials["snc"].get("api_url","")
+    token   = credentials["snc"].get("access_token","")
+    company = credentials["snc"].get("company_id","")
+    user_id = credentials["snc"].get("user_id","")
+
+    if not token:
+        return {"error": "No SNC token configured", "fix": "Paste your Bearer token in Data Sources"}
+
+    # Try raw HTTP call to see exact response
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            payload = {
+                "company_id":   company,
+                "user_id":      user_id,
+                "username":     credentials["snc"].get("username",""),
+                "timezone":     credentials["snc"].get("timezone","Asia/Singapore"),
+                "request_from": "WEB",
+                "data": {
+                    "filter_by": {
+                        "search_on": ["customer_name"],
+                        "search_text": "",
+                        "exact_match": False,
+                        "pagination": {"page_no": 1, "no_of_recs": 5, "sort_by": "cts", "order_by": False},
+                    }
+                }
+            }
+            resp = await client.post(
+                f"{api_url}/customers/get",
+                json=payload,
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            )
+            data = resp.json()
+            return {
+                "status_code":  resp.status_code,
+                "success":      data.get("status",{}).get("success"),
+                "job_id":       data.get("job_id"),
+                "has_result":   bool(data.get("result")),
+                "result_keys":  list(data.get("result",{}).keys()) if isinstance(data.get("result"),dict) else str(type(data.get("result"))),
+                "raw_snippet":  str(data)[:500],
+                "credentials":  {"api_url": api_url, "company_id": company, "has_token": bool(token), "has_user_id": bool(user_id)},
+            }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.post("/sync/customers")
 async def sync_customers(background_tasks: BackgroundTasks):
     background_tasks.add_task(_sync_customers_task)
