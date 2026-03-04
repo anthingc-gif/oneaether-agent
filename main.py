@@ -157,14 +157,27 @@ def db_log_message(chat_id: str, role: str, message: str, intent: str = ""):
 def db_upsert_customers(customers: List[Dict]):
     db = get_db()
     for c in customers:
+        # Handle both SNC formats: CustomersList items and /customers/get items
+        cid    = c.get("customer_id") or c.get("store_id") or c.get("id","")
+        name   = c.get("customer_name") or c.get("name") or c.get("store","")
+        phone  = c.get("customer_phone") or c.get("phone","")
+        email  = c.get("customer_email") or c.get("email","")
+        # B2B settings contain store/branch info
+        b2b    = c.get("b2b_settings") or {}
+        stores = b2b.get("stores") or c.get("stores") or []
+        store_id   = (stores[0].get("store_id","") if stores else "") or c.get("store_id","")
+        branch_id  = (stores[0].get("branch_id","") if stores else "") or c.get("branch_id","")
+        branch_name= (stores[0].get("branch_name","") if stores else "") or c.get("branch_name","Main Branch")
+        credit_term= c.get("credit_term","") or (b2b.get("credit_term") or {}).get("credit_term","")
+        status = c.get("status","Active")
+        if not cid: continue
         db.execute("""INSERT OR REPLACE INTO customers
             (customer_id,store_id,customer_name,phone,email,store,branch_id,branch_name,address,credit_term,status,raw,synced_at)
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))""",
-            (c.get("customer_id",""), c.get("store_id",""), c.get("customer_name",""),
-             c.get("phone",""), c.get("email",""), c.get("store",""),
-             c.get("branch_id",""), c.get("branch_name",""),
-             json.dumps(c.get("address",{})), c.get("credit_term",""),
-             c.get("status","Active"), json.dumps(c)))
+            (cid, store_id, name, phone, email, name,
+             branch_id, branch_name,
+             json.dumps(c.get("address",{})), credit_term,
+             status, json.dumps(c)))
     db.commit(); db.close()
     logger.info("Upserted %d customers", len(customers))
 
@@ -384,16 +397,18 @@ async def sync_customers_from_snc(page: int = 1, per_page: int = 100) -> int:
     if not result:
         logger.error("sync_customers: snc_call returned None")
         return 0
-    logger.info("sync_customers raw result keys: %s", list(result.keys()))
-    # Handle various response structures
-    r = result.get("result", result)
-    if isinstance(r, dict):
-        customers = r.get("data", r.get("customers", []))
-    elif isinstance(r, list):
-        customers = r
-    else:
-        customers = []
-    logger.info("sync_customers page=%d found=%d", page, len(customers))
+    # SNC returns: result.metadata.CustomersList
+    r = result.get("result", {})
+    metadata = r.get("metadata", {})
+    customers = (
+        metadata.get("CustomersList") or
+        metadata.get("customers") or
+        r.get("data", {}).get("CustomersList") or
+        r.get("CustomersList") or
+        (r.get("data") if isinstance(r.get("data"), list) else []) or
+        []
+    )
+    logger.info("sync_customers page=%d found=%d total=%s", page, len(customers), metadata.get("total_count"))
     if customers:
         db_upsert_customers(customers)
     return len(customers)
@@ -920,9 +935,10 @@ async def _sync_customers_task():
     while True:
         count = await sync_customers_from_snc(page=page, per_page=100)
         total += count
+        logger.info("Sync progress: page=%d got=%d running_total=%d", page, count, total)
         if count < 100: break
         page += 1
-    logger.info("Customer sync complete: %d total", total)
+    logger.info("Customer sync COMPLETE: %d customers stored", total)
 
 @app.post("/sync/products")
 async def sync_products(background_tasks: BackgroundTasks):
