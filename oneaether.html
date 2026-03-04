@@ -972,7 +972,7 @@ function WhatsAppScreen({ conn = {} }) {
     setShowAssign(true);
     if (customers.length === 0) await fetchCustomersAndBranches();
     // Fetch group members if it's a group
-    if (chat.id && chat.id.endsWith("@g.us") && !groupMembers[chat.id]) {
+    if (String(chat.id).endsWith("@g.us") && !groupMembers[chat.id]) {
       const agentUrl = conn.agentUrl || window.AGENT_URL || "";
       try {
         const res = await fetch(`${agentUrl}/proxy/whapi/group/${encodeURIComponent(chat.id)}`);
@@ -980,11 +980,11 @@ function WhatsAppScreen({ conn = {} }) {
           const d = await res.json();
           const members = (d.participants || []).map(p => ({
             id:    p.id,
-            phone: p.id ? p.id.replace("@s.whatsapp.net","") : "",
-            name:  p.name || (p.id ? p.id.replace("@s.whatsapp.net","") : ""),
+            phone: String(p.id).replace("@s.whatsapp.net",""),
+            name:  p.name || String(p.id).replace("@s.whatsapp.net",""),
             role:  p.rank || "member",
-            assignedCustomer: assignments[p.id]?.customer || null,
-            assignedBranch:   assignments[p.id]?.branch || null,
+            assignedCustomer: (assignments[p.id] && assignments[p.id].customer) || null,
+            assignedBranch:   (assignments[p.id] && assignments[p.id].branch) || null,
           }));
           setGroupMembers(g => ({...g, [chat.id]: members}));
         }
@@ -1020,11 +1020,11 @@ function WhatsAppScreen({ conn = {} }) {
   // ── Map raw Whapi objects to our internal format ──
   const mapChat = c => ({
     id:      c.id,
-    name:    c.name || c.id?.replace("@s.whatsapp.net","").replace("@g.us",""),
-    phone:   c.id?.replace("@s.whatsapp.net","").replace("@g.us",""),
+    name:    c.name || String(c.id).replace("@s.whatsapp.net","").replace("@g.us",""),
+    phone:   String(c.id).replace("@s.whatsapp.net","").replace("@g.us",""),
     avatar:  ((c.name||"?").split(" ").map(w=>w[0]).join("").slice(0,2)||"?").toUpperCase(),
-    lastMsg: c.last_message?.text?.body || c.last_message?.body || c.last_message?.caption || "",
-    time:    c.last_message?.timestamp
+    lastMsg: (c.last_message && c.last_message.text && c.last_message.text.body) || (c.last_message && c.last_message.body) || (c.last_message && c.last_message.caption) || "",
+    time:    (c.last_message && c.last_message.timestamp)
                ? new Date(c.last_message.timestamp * 1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})
                : "",
     unread:  c.unread_count || 0,
@@ -1035,14 +1035,14 @@ function WhatsAppScreen({ conn = {} }) {
   const mapMsg = m => ({
     id:   m.id,
     from: m.from_me ? "us" : "them",
-    text: m.text?.body
-          || m.image?.caption
-          || m.video?.caption
-          || m.document?.caption
+    text: (m.text && m.text.body)
+          || (m.image && m.image.caption)
+          || (m.video && m.video.caption)
+          || (m.document && m.document.caption)
           || (m.type==="audio"||m.type==="voice" ? "🎙️ Voice message" : null)
           || (m.type==="image" ? "📷 Image" : null)
           || (m.type==="video" ? "🎬 Video" : null)
-          || (m.type==="document" ? "📎 "+(m.document?.file_name||"Document") : null)
+          || (m.type==="document" ? "📎 "+((m.document && m.document.file_name)||"Document") : null)
           || "["+( m.type||"media")+"]",
     time: m.timestamp ? new Date(m.timestamp*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}) : "",
     intent: null,
@@ -1091,7 +1091,7 @@ function WhatsAppScreen({ conn = {} }) {
         { headers: proxyHdr }
       );
       const data = await res.json();
-      const chatsArr = Array.isArray(data?.chats) ? data.chats : Array.isArray(data) ? data : [];
+      const chatsArr = Array.isArray((data && data.chats)) ? data.chats : Array.isArray(data) ? data : [];
       if (chatsArr.length > 0) {
         const mapped = chatsArr.map(mapChat);
         setChats(mapped);
@@ -1115,7 +1115,7 @@ function WhatsAppScreen({ conn = {} }) {
         { headers: proxyHdr }
       );
       const data = await res.json();
-      const msgsArr = Array.isArray(data?.messages) ? data.messages : Array.isArray(data) ? data : [];
+      const msgsArr = Array.isArray((data && data.messages)) ? data.messages : Array.isArray(data) ? data : [];
       if (msgsArr.length > 0) {
         const mapped = [...msgsArr].reverse().map(mapMsg);
         setChats(cs => cs.map(c => c.id === chatId ? {...c, messages: mapped, unread: 0} : c));
@@ -1135,15 +1135,15 @@ function WhatsAppScreen({ conn = {} }) {
 
   // ── Fetch messages when switching chats ──
   useEffect(() => {
-    if (wapiOk && active?.id) fetchMessages(active.id);
-  }, [active?.id, wapiOk]);
+    if (wapiOk && (active && active.id)) fetchMessages(active.id);
+  }, [(active && active.id), wapiOk]);
 
   // ── Scroll to bottom on new messages ──
   useEffect(() => {
-    msgEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [chats, active?.id]);
+    msgEndRef.current && msgEndRef.current.scrollIntoView({ behavior: "smooth" });
+  }, [chats, (active && active.id)]);
 
-  const cur = chats.find(c=>c.id===active?.id);
+  const cur = chats.find(c=>String(c.id)===String(active && active.id));
   const filteredChats = chats.filter(c =>
     c.name.toLowerCase().includes(searchQ.toLowerCase()) ||
     c.lastMsg.toLowerCase().includes(searchQ.toLowerCase())
@@ -1190,13 +1190,13 @@ function WhatsAppScreen({ conn = {} }) {
             {assignLoading && <div style={{color:"var(--text2)",fontSize:13,marginBottom:12}}>Loading customers...</div>}
 
             {/* Individual chat assignment */}
-            {!assignChat.id && assignChat.id.endsWith("@g.us") && (
+            {!String(assignChat.id).endsWith("@g.us") && (
               <div>
                 <div style={{fontSize:11,textTransform:"uppercase",letterSpacing:1,color:"var(--text2)",fontWeight:700,marginBottom:10}}>Assign to Customer</div>
                 <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:16}}>
                   <div>
                     <label style={{fontSize:11,color:"var(--text2)",display:"block",marginBottom:4}}>CUSTOMER</label>
-                    <select className="form-input" value={assignments[assignChat.id]?.store_id||""}
+                    <select className="form-input" value={(assignments[assignChat.id] && assignments[assignChat.id].store_id)||""}
                       onChange={e=>{
                         const c = customers.find(x=>x.store_id===e.target.value);
                         if(c) saveAssignment(assignChat.id,null,"customer",c.label,{store_id:c.store_id,customer_id:c.id,branches:c.branches});
@@ -1207,14 +1207,14 @@ function WhatsAppScreen({ conn = {} }) {
                   </div>
                   <div>
                     <label style={{fontSize:11,color:"var(--text2)",display:"block",marginBottom:4}}>BRANCH</label>
-                    <select className="form-input" value={assignments[assignChat.id]?.branch_id||""}
+                    <select className="form-input" value={(assignments[assignChat.id] && assignments[assignChat.id].branch_id)||""}
                       onChange={e=>{
-                        const branches = assignments[assignChat.id]?.branches||[];
+                        const branches = (assignments[assignChat.id] && assignments[assignChat.id].branches)||[];
                         const b = branches.find(x=>x.branch_id===e.target.value);
                         if(b) saveAssignment(assignChat.id,null,"branch",b.branch_name,{branch_id:b.branch_id});
                       }}>
                       <option value="">— Select Branch —</option>
-                      {(assignments[assignChat.id]?.branches||[]).map(b=><option key={b.branch_id} value={b.branch_id}>{b.branch_name}</option>)}
+                      {((assignments[assignChat.id] && assignments[assignChat.id].branches)||[]).map(b=><option key={b.branch_id} value={b.branch_id}>{b.branch_name}</option>)}
                     </select>
                   </div>
                 </div>
@@ -1222,7 +1222,7 @@ function WhatsAppScreen({ conn = {} }) {
             )}
 
             {/* Group chat — assign per member */}
-            {assignChat.id && assignChat.id.endsWith("@g.us") && (
+            {String(assignChat.id).endsWith("@g.us") && (
               <div>
                 <div style={{fontSize:11,textTransform:"uppercase",letterSpacing:1,color:"var(--text2)",fontWeight:700,marginBottom:10}}>
                   Assign Customers to Members
@@ -1241,7 +1241,7 @@ function WhatsAppScreen({ conn = {} }) {
                         <div style={{fontSize:10,color:"var(--text2)"}}>{m.phone}</div>
                       </div>
                     </div>
-                    <select className="form-input" style={{fontSize:11,padding:"5px 8px"}} value={assignments[m.id]?.store_id||""}
+                    <select className="form-input" style={{fontSize:11,padding:"5px 8px"}} value={(assignments[m.id] && assignments[m.id].store_id)||""}
                       onChange={e=>{
                         const c=customers.find(x=>x.store_id===e.target.value);
                         if(c) saveAssignment(null,m.id,"customer",c.label,{store_id:c.store_id,branches:c.branches});
@@ -1251,12 +1251,12 @@ function WhatsAppScreen({ conn = {} }) {
                     </select>
                     <select className="form-input" style={{fontSize:11,padding:"5px 8px"}} value={assignments[m.id] && assignments[m.id].branch_id||""}
                       onChange={e=>{
-                        const branches=assignments[m.id]?.branches||[];
+                        const branches=(assignments[m.id] && assignments[m.id].branches)||[];
                         const b=branches.find(x=>x.branch_id===e.target.value);
                         if(b) saveAssignment(null,m.id,"branch",b.branch_name,{branch_id:b.branch_id});
                       }}>
                       <option value="">— Branch —</option>
-                      {(assignments[m.id]?.branches||[]).map(b=><option key={b.branch_id} value={b.branch_id}>{b.branch_name}</option>)}
+                      {((assignments[m.id] && assignments[m.id].branches)||[]).map(b=><option key={b.branch_id} value={b.branch_id}>{b.branch_name}</option>)}
                     </select>
                   </div>
                 ))}
@@ -1331,7 +1331,7 @@ function WhatsAppScreen({ conn = {} }) {
             <input placeholder="Search conversations..." value={searchQ} onChange={e=>setSearchQ(e.target.value)} style={{width:"100%",background:"var(--bg2)",border:"1px solid var(--border)",borderRadius:20,padding:"8px 14px",color:"var(--text)",fontSize:13,outline:"none"}}/>
           </div>
           <div className="wa-list">{filteredChats.map((c,i)=>(
-            <div key={c.id} className={`wa-chat-item${active?.id===c.id?" active":""}`} onClick={()=>setActive(c)}>
+            <div key={c.id} className={`wa-chat-item${String(active && active.id)===String(c.id)?" active":""}`} onClick={()=>setActive(c)}>
               <div className={`wa-avatar ${getAV(i)}`} style={{position:"relative"}}>{c.avatar}{c.online&&<div className="wa-online-dot"/>}</div>
               <div className="wa-chat-info">
                 <div className="wa-chat-name">{c.name}</div>
@@ -1352,7 +1352,7 @@ function WhatsAppScreen({ conn = {} }) {
               <div style={{flex:1}}>
                 <div style={{display:"flex",alignItems:"center",gap:8}}>
                   <div style={{fontWeight:700,fontSize:14}}>{cur.name}</div>
-                  {cur.id && cur.id.endsWith("@g.us") && <span style={{fontSize:10,background:"#7c4dff22",color:"#a78bfa",padding:"2px 6px",borderRadius:10,fontWeight:700}}>GROUP</span>}
+                  {String(cur.id).endsWith("@g.us") && <span style={{fontSize:10,background:"#7c4dff22",color:"#a78bfa",padding:"2px 6px",borderRadius:10,fontWeight:700}}>GROUP</span>}
                   {assignments[cur.id] && assignments[cur.id].customer && (
                     <span style={{fontSize:10,background:"#00d9a320",color:"var(--accent)",padding:"2px 6px",borderRadius:10}}>
                       👤 {assignments[cur.id].customer}
@@ -1360,7 +1360,7 @@ function WhatsAppScreen({ conn = {} }) {
                   )}
                 </div>
                 <div style={{fontSize:11,color:"var(--text2)",marginTop:2}}>
-                  {cur.id && cur.id.endsWith("@g.us")
+                  {String(cur.id).endsWith("@g.us")
                     ? `${(groupMembers[cur.id]||[]).length || "?"} members`
                     : (cur.online ? "● Online" : "Last seen recently")}
                   {assignments[cur.id] && assignments[cur.id].branch && <span style={{marginLeft:8,color:"#60a5fa"}}>📍 {assignments[cur.id].branch}</span>}
@@ -1375,7 +1375,7 @@ function WhatsAppScreen({ conn = {} }) {
             </div>
 
             {/* Group members strip */}
-            {cur.id && cur.id.endsWith("@g.us") && (groupMembers[cur.id] && groupMembers[cur.id].length) > 0 && (
+            {String(cur.id).endsWith("@g.us") && (groupMembers[cur.id] && groupMembers[cur.id].length) > 0 && (
               <div style={{padding:"8px 16px",background:"#7c4dff0a",borderBottom:"1px solid var(--border)",display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
                 <span style={{fontSize:10,color:"#a78bfa",fontWeight:700,textTransform:"uppercase",letterSpacing:1}}>Members:</span>
                 {groupMembers[cur.id].map((m,i) => (
