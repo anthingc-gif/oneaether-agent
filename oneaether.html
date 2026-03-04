@@ -872,9 +872,22 @@ function CustomersScreen({ conn = {} }) {
     try {
       await fetch(`${agentUrl}/sync/customers`, { method: "POST" });
       setLastSync(new Date().toLocaleTimeString());
-      setTimeout(() => fetchCustomers(1, search), 3000); // wait for sync then reload
-    } catch(e) { setError("Sync failed: " + e.message); }
-    finally { setSyncing(false); }
+      // Poll every 2s until customers appear (max 30s)
+      let attempts = 0;
+      const poll = async () => {
+        attempts++;
+        await fetchCustomers(1, search);
+        if (customers.length === 0 && attempts < 15) {
+          setTimeout(poll, 2000);
+        } else {
+          setSyncing(false);
+        }
+      };
+      setTimeout(poll, 2000);
+    } catch(e) {
+      setError("Sync failed: " + e.message);
+      setSyncing(false);
+    }
   };
 
   useEffect(() => { fetchCustomers(1, ""); }, [agentUrl]);
@@ -1062,6 +1075,13 @@ function WhatsAppScreen({ conn = {} }) {
 
   // Assign Customer modal state
   const [showAssign, setShowAssign]   = useState(false);
+  // Create Order modal state
+  const [showCreateOrder, setShowCreateOrder] = useState(false);
+  const [createOrderChat, setCreateOrderChat] = useState(null);
+  const [orderItems, setOrderItems]           = useState([{name:"",qty:1,uom:"unit"}]);
+  const [orderDelivery, setOrderDelivery]     = useState("");
+  const [orderLoading, setOrderLoading]       = useState(false);
+  const [orderResult, setOrderResult]         = useState(null);
   const [assignChat, setAssignChat]   = useState(null);
   const [customers,  setCustomers]    = useState([]);
   const [branches,   setBranches]     = useState([]);
@@ -1082,13 +1102,19 @@ function WhatsAppScreen({ conn = {} }) {
       });
       if (custRes.ok) {
         const d = await custRes.json();
-        const list = (d && d.result && d.result.data) || [];
+        // Try multiple response formats from SNC
+        const list = (d && d.result && d.result.data) ||
+                     (d && d.result && Array.isArray(d.result) ? d.result : []) ||
+                     (Array.isArray(d) ? d : []);
+        console.log("Customers for assign:", list.length, "items", list[0]);
         setCustomers(list.map(c => ({
-          id:        c.store_id || c.customer_id,
-          store_id:  c.store_id,
-          label:     c.customer_name || c.store || c.name,
-          branches:  c.branches || [],
+          id:        c.store_id || c.customer_id || c.id,
+          store_id:  c.store_id || "",
+          label:     c.customer_name || c.store || c.name || "Unknown",
+          branches:  c.branches || c.branch_info || [],
         })));
+      } else {
+        console.warn("Customer fetch failed:", custRes.status);
       }
     } catch(e) { console.warn("Fetch customers failed:", e); }
     finally { setAssignLoading(false); }
@@ -1302,6 +1328,112 @@ function WhatsAppScreen({ conn = {} }) {
 
   return (
     <div style={{display:"flex",flexDirection:"column",height:"calc(100vh - 52px)",overflow:"hidden"}}>
+      {/* ── Create Order Modal ── */}
+      {showCreateOrder && createOrderChat && (
+        <div style={{position:"fixed",inset:0,background:"#000a",zIndex:1001,display:"flex",alignItems:"center",justifyContent:"center"}}
+          onClick={()=>{setShowCreateOrder(false);setOrderResult(null);setOrderItems([{name:"",qty:1,uom:"unit"}]);}}>
+          <div style={{background:"var(--bg2)",border:"1px solid var(--border)",borderRadius:"var(--r)",width:520,maxHeight:"80vh",overflow:"auto",padding:24}}
+            onClick={e=>e.stopPropagation()}>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16}}>
+              <div>
+                <div style={{fontFamily:"var(--fh)",fontWeight:700,fontSize:16}}>🛒 Create Order</div>
+                <div style={{fontSize:12,color:"var(--text2)",marginTop:2}}>
+                  {createOrderChat.name} · {assignments[createOrderChat.id] ? assignments[createOrderChat.id].customer : "No customer assigned"}
+                </div>
+              </div>
+              <button className="btn btn-ghost btn-sm" onClick={()=>{setShowCreateOrder(false);setOrderResult(null);}}>✕</button>
+            </div>
+
+            {!assignments[createOrderChat.id] && (
+              <div style={{background:"#f59e0b15",border:"1px solid #f59e0b40",borderRadius:"var(--r2)",padding:"10px 14px",color:"var(--warn)",fontSize:12,marginBottom:12}}>
+                ⚠️ No customer assigned to this chat. Please assign a customer first.
+              </div>
+            )}
+
+            {orderResult ? (
+              <div style={{textAlign:"center",padding:"20px 0"}}>
+                {orderResult.success ? (
+                  <>
+                    <div style={{fontSize:40,marginBottom:12}}>✅</div>
+                    <div style={{fontWeight:700,fontSize:16,marginBottom:8}}>Order Placed!</div>
+                    <div style={{color:"var(--accent)",fontFamily:"monospace",fontSize:14,marginBottom:16}}>{orderResult.order_number}</div>
+                    <button className="btn btn-primary" onClick={()=>{setShowCreateOrder(false);setOrderResult(null);setOrderItems([{name:"",qty:1,uom:"unit"}]);}}>Done</button>
+                  </>
+                ) : (
+                  <>
+                    <div style={{fontSize:40,marginBottom:12}}>⚠️</div>
+                    <div style={{fontWeight:700,marginBottom:8}}>Order Failed</div>
+                    <div style={{fontSize:12,color:"var(--text2)",marginBottom:16}}>{orderResult.error}</div>
+                    <button className="btn btn-ghost" onClick={()=>setOrderResult(null)}>Try Again</button>
+                  </>
+                )}
+              </div>
+            ) : (
+              <>
+                <div style={{fontSize:11,textTransform:"uppercase",letterSpacing:1,color:"var(--text2)",fontWeight:700,marginBottom:10}}>Order Items</div>
+                {orderItems.map((item,i)=>(
+                  <div key={i} style={{display:"grid",gridTemplateColumns:"1fr 80px 80px 32px",gap:8,marginBottom:8,alignItems:"center"}}>
+                    <input className="form-input" placeholder="Product name..." value={item.name}
+                      onChange={e=>{const a=[...orderItems];a[i]={...a[i],name:e.target.value};setOrderItems(a);}}/>
+                    <input className="form-input" type="number" min="1" placeholder="Qty" value={item.qty}
+                      onChange={e=>{const a=[...orderItems];a[i]={...a[i],qty:parseInt(e.target.value)||1};setOrderItems(a);}}/>
+                    <select className="form-input" value={item.uom}
+                      onChange={e=>{const a=[...orderItems];a[i]={...a[i],uom:e.target.value};setOrderItems(a);}}>
+                      {["unit","pkt","box","kg","pcs","bag","can","bottle","carton"].map(u=><option key={u} value={u}>{u}</option>)}
+                    </select>
+                    <button className="btn btn-ghost btn-sm" style={{padding:"4px 8px",color:"#ef4444"}}
+                      onClick={()=>setOrderItems(orderItems.filter((_,j)=>j!==i))}>✕</button>
+                  </div>
+                ))}
+                <button className="btn btn-ghost btn-sm" style={{marginBottom:16}} onClick={()=>setOrderItems([...orderItems,{name:"",qty:1,uom:"unit"}])}>
+                  + Add Item
+                </button>
+
+                <div style={{marginBottom:16}}>
+                  <label style={{fontSize:11,color:"var(--text2)",display:"block",marginBottom:4}}>DELIVERY DATE</label>
+                  <input className="form-input" type="date" value={orderDelivery}
+                    onChange={e=>setOrderDelivery(e.target.value)}
+                    min={new Date().toISOString().split("T")[0]}/>
+                </div>
+
+                <div style={{display:"flex",gap:10,justifyContent:"flex-end"}}>
+                  <button className="btn btn-ghost" onClick={()=>setShowCreateOrder(false)}>Cancel</button>
+                  <button className="btn btn-primary" disabled={orderLoading || orderItems.filter(x=>x.name.trim()).length===0}
+                    onClick={async ()=>{
+                      setOrderLoading(true);
+                      const agentUrl = conn.agentUrl || window.AGENT_URL || "";
+                      try {
+                        const res = await fetch(`${agentUrl}/orders/create`, {
+                          method: "POST",
+                          headers: {"Content-Type":"application/json"},
+                          body: JSON.stringify({
+                            chat_id:       createOrderChat.id,
+                            items:         orderItems.filter(x=>x.name.trim()),
+                            delivery_date: orderDelivery,
+                            sender_name:   createOrderChat.name,
+                          })
+                        });
+                        const data = await res.json();
+                        if (res.ok && data.order_number) {
+                          setOrderResult({success:true, order_number: data.order_number});
+                        } else {
+                          setOrderResult({success:false, error: data.detail || data.error || "Order creation failed"});
+                        }
+                      } catch(e) {
+                        setOrderResult({success:false, error: e.message});
+                      } finally {
+                        setOrderLoading(false);
+                      }
+                    }}>
+                    {orderLoading ? "⏳ Placing..." : "✅ Place Order"}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* ── Assign Customer Modal ── */}
       {showAssign && assignChat && (
         <div style={{position:"fixed",inset:0,background:"#000a",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>setShowAssign(false)}>
@@ -1498,7 +1630,15 @@ function WhatsAppScreen({ conn = {} }) {
                 onClick={()=>openAssignModal(cur)}>
                 + Assign Customer
               </button>
-              <button className="btn btn-primary btn-sm">🛒 Create Order</button>
+              <button className="btn btn-primary btn-sm" onClick={()=>{
+                const a = assignments[cur.id];
+                if (!a || !a.store_id) {
+                  alert("Please assign a customer to this chat first using the '+ Assign Customer' button");
+                  return;
+                }
+                setCreateOrderChat(cur);
+                setShowCreateOrder(true);
+              }}>🛒 Create Order</button>
             </div>
 
             {/* Group members strip */}
