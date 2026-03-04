@@ -1095,26 +1095,23 @@ function WhatsAppScreen({ conn = {} }) {
     if (!agentUrl) return;
     setAssignLoading(true);
     try {
-      // Fetch customers
-      const custRes = await fetch(`${agentUrl}/proxy/snc/customers`, {
-        method: "POST", headers: {"Content-Type":"application/json"},
-        body: JSON.stringify({filter_by: {search_text:"", pagination:{page_no:1,no_of_recs:100,sort_by:"cts",order_by:false}}})
-      });
-      if (custRes.ok) {
-        const d = await custRes.json();
-        // Try multiple response formats from SNC
-        const list = (d && d.result && d.result.data) ||
-                     (d && d.result && Array.isArray(d.result) ? d.result : []) ||
-                     (Array.isArray(d) ? d : []);
-        console.log("Customers for assign:", list.length, "items", list[0]);
+      // Load from our local DB (synced from SNC)
+      const res = await fetch(`${agentUrl}/data/customers?per_page=200`);
+      if (res.ok) {
+        const d = await res.json();
+        const list = d.customers || [];
+        console.log("Customers for assign loaded:", list.length, list[0]);
+        if (list.length === 0) {
+          console.warn("No customers in DB — trigger a sync first");
+        }
         setCustomers(list.map(c => ({
-          id:        c.store_id || c.customer_id || c.id,
-          store_id:  c.store_id || "",
-          label:     c.customer_name || c.store || c.name || "Unknown",
-          branches:  c.branches || c.branch_info || [],
+          id:         c.customer_id || c.store_id,
+          store_id:   c.store_id || "",
+          branch_id:  c.branch_id || "",
+          label:      c.customer_name || c.store || "Unknown",
+          branch:     c.branch_name || "Main Branch",
+          branches:   c.branch_id ? [{branch_id: c.branch_id, branch_name: c.branch_name || "Main Branch"}] : [],
         })));
-      } else {
-        console.warn("Customer fetch failed:", custRes.status);
       }
     } catch(e) { console.warn("Fetch customers failed:", e); }
     finally { setAssignLoading(false); }
@@ -1446,7 +1443,19 @@ function WhatsAppScreen({ conn = {} }) {
               <button className="btn btn-ghost btn-sm" onClick={()=>setShowAssign(false)}>✕</button>
             </div>
 
-            {assignLoading && <div style={{color:"var(--text2)",fontSize:13,marginBottom:12}}>Loading customers...</div>}
+            {assignLoading && <div style={{color:"var(--accent)",fontSize:13,marginBottom:12}}>⏳ Loading customers...</div>}
+            {!assignLoading && customers.length === 0 && (
+              <div style={{background:"#f59e0b15",border:"1px solid #f59e0b30",borderRadius:"var(--r2)",padding:"10px 14px",marginBottom:12}}>
+                <div style={{fontSize:12,color:"var(--warn)",marginBottom:8}}>⚠️ No customers loaded. Sync from SNC first.</div>
+                <button className="btn btn-primary btn-sm" onClick={async()=>{
+                  const agentUrl = conn.agentUrl || window.AGENT_URL || "";
+                  setAssignLoading(true);
+                  await fetch(`${agentUrl}/sync/customers`,{method:"POST"});
+                  setTimeout(()=>fetchCustomersAndBranches(), 4000);
+                }}>↻ Sync Customers from SNC</button>
+              </div>
+            )}
+            {customers.length > 0 && <div style={{fontSize:11,color:"var(--accent)",marginBottom:8}}>✓ {customers.length} customers loaded</div>}
 
             {/* Individual chat assignment */}
             {!String(assignChat.id).endsWith("@g.us") && (
@@ -1458,7 +1467,9 @@ function WhatsAppScreen({ conn = {} }) {
                     <select className="form-input" value={(assignments[assignChat.id] && assignments[assignChat.id].store_id)||""}
                       onChange={e=>{
                         const c = (customers||[]).find(x=>x.store_id===e.target.value);
-                        if(c) saveAssignment(assignChat.id,null,"customer",c.label,{store_id:c.store_id,customer_id:c.id,branches:c.branches});
+                        if(c) {
+                          saveAssignment(assignChat.id,null,"customer",c.label,{store_id:c.store_id,customer_id:c.id,branch_id:c.branch_id,branch:c.branch,branches:c.branches});
+                        }
                       }}>
                       <option value="">— Select Customer —</option>
                       {(customers||[]).map(c=><option key={c.id} value={c.store_id}>{c.label}</option>)}
@@ -1488,7 +1499,20 @@ function WhatsAppScreen({ conn = {} }) {
                 </div>
                 {(groupMembers[assignChat.id]||[]).length === 0 && (
                   <div style={{color:"var(--text2)",fontSize:12,padding:"20px",textAlign:"center",border:"1px dashed var(--border)",borderRadius:"var(--r2)"}}>
-                    Loading group members... (requires Whapi group endpoint)
+                    <div style={{marginBottom:8}}>⏳ Loading group members from Whapi...</div>
+                    <div style={{fontSize:11}}>If this stays empty, Whapi may not support group member lookup for your plan.</div>
+                    <div style={{marginTop:12,fontSize:11,color:"var(--accent)"}}>
+                      You can assign this group chat as a whole to a customer instead:
+                    </div>
+                    <div style={{display:"flex",gap:8,marginTop:8,justifyContent:"center"}}>
+                      <select className="form-input" style={{width:200,fontSize:11}} onChange={e=>{
+                        const c=(customers||[]).find(x=>x.store_id===e.target.value);
+                        if(c) saveAssignment(assignChat.id,null,"customer",c.label,{store_id:c.store_id,branch_id:c.branch_id,branch:c.branch});
+                      }}>
+                        <option value="">— Assign whole group —</option>
+                        {(customers||[]).map(c=><option key={c.id} value={c.store_id}>{c.label}</option>)}
+                      </select>
+                    </div>
                   </div>
                 )}
                 {(groupMembers[assignChat.id]||[]).map((m,i)=>(
