@@ -1023,6 +1023,62 @@ async def get_stats():
     return stats
 
 # ─── Assignments ──────────────────────────────────────────────────────────────
+@app.get("/data/customer/{customer_id}/branches")
+async def get_customer_branches(customer_id: str):
+    """Get branches for a customer from DB or SNC."""
+    # Check DB first
+    db = get_db()
+    row = db.execute("SELECT raw FROM customers WHERE customer_id=?", (customer_id,)).fetchone()
+    db.close()
+    if row:
+        try:
+            raw = json.loads(row["raw"])
+            b2b = raw.get("b2b_settings") or {}
+            stores = b2b.get("stores") or raw.get("stores") or []
+            if stores:
+                branches = []
+                for s in stores:
+                    for br in s.get("branches") or [s] if s.get("branch_id") else []:
+                        branches.append({
+                            "branch_id":   br.get("branch_id", s.get("branch_id","")),
+                            "branch_name": br.get("branch_name", s.get("branch_name","Main Branch")),
+                            "store_id":    s.get("store_id",""),
+                            "store_name":  s.get("store_name", s.get("store","")),
+                        })
+                if branches:
+                    return {"branches": branches}
+        except Exception as e:
+            logger.warning("Branch parse error: %s", e)
+
+    # Fallback: fetch from SNC
+    result = await snc_call("/customers/get", {"data": {"filter_by": {
+        "search_on": ["customer_id"],
+        "search_text": customer_id,
+        "exact_match": True,
+        "pagination": {"page_no": 1, "no_of_recs": 1, "sort_by": "cts", "order_by": False},
+    }}})
+    if result:
+        r = result.get("result", {})
+        meta = r.get("metadata", {})
+        customers = meta.get("CustomersList", [])
+        if customers:
+            c = customers[0]
+            b2b = c.get("b2b_settings") or {}
+            stores = b2b.get("stores") or []
+            branches = []
+            for s in stores:
+                for br in s.get("branches") or [{"branch_id": s.get("branch_id",""), "branch_name": s.get("branch_name","Main Branch")}]:
+                    branches.append({
+                        "branch_id":   br.get("branch_id",""),
+                        "branch_name": br.get("branch_name","Main Branch"),
+                        "store_id":    s.get("store_id",""),
+                        "store_name":  s.get("store_name",""),
+                    })
+            return {"branches": branches or [{"branch_id":"main","branch_name":"Main Branch","store_id":"","store_name":""}]}
+
+    return {"branches": [{"branch_id": "main", "branch_name": "Main Branch", "store_id": "", "store_name": ""}]}
+
+
 @app.post("/assignments")
 async def save_assignments(request: Request):
     body = await request.json()
@@ -1180,43 +1236,65 @@ async def proxy_snc_orders(request: Request):
 @app.post("/orders/create")
 async def create_order_manual(request: Request):
     """Create order manually from the UI Create Order button."""
-    body          = await request.json()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+
     chat_id       = body.get("chat_id", "")
     items_raw     = body.get("items", [])
     delivery_date = body.get("delivery_date", "")
     sender_name   = body.get("sender_name", "")
 
+    logger.info("create_order: chat=%s items=%s delivery=%s", chat_id, items_raw, delivery_date)
+
     if not items_raw:
         raise HTTPException(status_code=400, detail="No items provided")
 
-    # Convert raw items to lookup format
-    items = [{"name": i["name"], "qty": i.get("qty",1), "uom": i.get("uom","unit")} for i in items_raw if i.get("name","").strip()]
+    items = [{"name": i["name"], "qty": i.get("qty",1), "uom": i.get("uom","unit")}
+             for i in items_raw if i.get("name","").strip()]
 
     # Look up products in SNC
     enriched = await lookup_products_for_items(items)
     found    = [i for i in enriched if i.get("found")]
+    missing  = [i for i in enriched if not i.get("found")]
 
+    logger.info("create_order: found=%d missing=%d", len(found), len(missing))
+
+    # If no products found in DB/SNC, create order with basic item info anyway
     if not found:
-        names = ", ".join(i["name"] for i in items)
-        raise HTTPException(status_code=404, detail=f"Products not found in SNC catalogue: {names}")
+        logger.warning("create_order: no products matched in SNC — using raw items")
+        # Build minimal items without SNC product lookup
+        found = [{
+            "item_id": "", "sku": i["name"], "full_name": i["name"],
+            "uom": i.get("uom","unit"), "uom_id": "", "base_uom": i.get("uom","unit"),
+            "base_uom_id": "", "price": 0, "tax_rate": 9,
+            "tax_code": "SR9", "tax_code_id": "", "qty": i["qty"], "found": True,
+        } for i in items]
 
-    # Create order
-    order_num = await push_order_to_snc(
-        items=found,
-        chat_id=chat_id,
-        delivery_date=delivery_date,
-        sender_name=sender_name,
-    )
+    try:
+        order_num = await push_order_to_snc(
+            items=found, chat_id=chat_id,
+            delivery_date=delivery_date, sender_name=sender_name,
+        )
+    except Exception as e:
+        logger.error("push_order_to_snc exception: %s", e)
+        raise HTTPException(status_code=502, detail=f"Order creation error: {str(e)}")
 
     if not order_num:
-        raise HTTPException(status_code=502, detail="Order creation failed — check SNC credentials and customer assignment")
+        assignment = db_get_assignment(chat_id) or {}
+        raise HTTPException(status_code=502, detail=(
+            f"Order creation failed. "
+            f"store_id={'✓' if assignment.get('store_id') else '✗ MISSING'} "
+            f"branch_id={'✓' if assignment.get('branch_id') else '✗ MISSING'} "
+            f"token={'✓' if credentials['snc'].get('access_token') else '✗ MISSING'}"
+        ))
 
-    # Send WhatsApp confirmation
     item_lines = ", ".join([f"{i['full_name']} x{i['qty']}" for i in found])
     msg = f"✅ Order *{order_num}* placed!\n📦 {item_lines}\n📅 Delivery: {delivery_date or 'as scheduled'}"
     await whapi_send(chat_id, msg)
 
-    return {"order_number": order_num, "items": len(found), "status": "created"}
+    return {"order_number": order_num, "items": len(found), "missing": [i["name"] for i in missing], "status": "created"}
 
 
 @app.get("/agent/status")
