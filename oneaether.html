@@ -933,6 +933,90 @@ function WhatsAppScreen({ conn = {} }) {
   const [sending, setSending] = useState(false);
   const msgEndRef = useRef(null);
 
+  // Assign Customer modal state
+  const [showAssign, setShowAssign]   = useState(false);
+  const [assignChat, setAssignChat]   = useState(null);
+  const [customers,  setCustomers]    = useState([]);
+  const [branches,   setBranches]     = useState([]);
+  const [assignments, setAssignments] = useState({}); // chat_id → {customer, branch, customer_id, branch_id, store_id}
+  const [assignLoading, setAssignLoading] = useState(false);
+  const [groupMembers, setGroupMembers]   = useState({}); // chat_id → [members]
+
+  // ── Fetch customers + branches from SNC for assignment ──
+  const fetchCustomersAndBranches = async () => {
+    const agentUrl = conn.agentUrl || window.AGENT_URL || "";
+    if (!agentUrl || !conn.erpOk) return;
+    setAssignLoading(true);
+    try {
+      // Fetch customers
+      const custRes = await fetch(`${agentUrl}/proxy/snc/customers`, {
+        method: "POST", headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({filter_by: {search_text:"", pagination:{page_no:1,no_of_recs:100,sort_by:"cts",order_by:false}}})
+      });
+      if (custRes.ok) {
+        const d = await custRes.json();
+        const list = d?.result?.data || [];
+        setCustomers(list.map(c => ({
+          id:        c.store_id || c.customer_id,
+          store_id:  c.store_id,
+          label:     c.customer_name || c.store || c.name,
+          branches:  c.branches || [],
+        })));
+      }
+    } catch(e) { console.warn("Fetch customers failed:", e); }
+    finally { setAssignLoading(false); }
+  };
+
+  const openAssignModal = async (chat) => {
+    setAssignChat(chat);
+    setShowAssign(true);
+    if (customers.length === 0) await fetchCustomersAndBranches();
+    // Fetch group members if it's a group
+    if (chat.id?.endsWith("@g.us") && !groupMembers[chat.id]) {
+      const agentUrl = conn.agentUrl || window.AGENT_URL || "";
+      try {
+        const res = await fetch(`${agentUrl}/proxy/whapi/group/${encodeURIComponent(chat.id)}`);
+        if (res.ok) {
+          const d = await res.json();
+          const members = (d.participants || []).map(p => ({
+            id:    p.id,
+            phone: p.id?.replace("@s.whatsapp.net",""),
+            name:  p.name || p.id?.replace("@s.whatsapp.net",""),
+            role:  p.rank || "member",
+            assignedCustomer: assignments[p.id]?.customer || null,
+            assignedBranch:   assignments[p.id]?.branch || null,
+          }));
+          setGroupMembers(g => ({...g, [chat.id]: members}));
+        }
+      } catch(e) { console.warn("Group members fetch failed:", e); }
+    }
+  };
+
+  const saveAssignment = (chatId, memberId, field, value, extra={}) => {
+    setAssignments(a => ({
+      ...a,
+      [memberId || chatId]: {
+        ...(a[memberId || chatId] || {}),
+        [field]: value,
+        ...extra,
+      }
+    }));
+  };
+
+  const confirmAssignment = async () => {
+    // Save assignments to backend agent so orders use correct store_id/branch_id
+    const agentUrl = conn.agentUrl || window.AGENT_URL || "";
+    if (agentUrl) {
+      try {
+        await fetch(`${agentUrl}/assignments`, {
+          method: "POST", headers: {"Content-Type":"application/json"},
+          body: JSON.stringify({assignments})
+        });
+      } catch(e) {}
+    }
+    setShowAssign(false);
+  };
+
   // ── Map raw Whapi objects to our internal format ──
   const mapChat = c => ({
     id:      c.id,
@@ -1091,6 +1175,102 @@ function WhatsAppScreen({ conn = {} }) {
 
   return (
     <div style={{display:"flex",flexDirection:"column",height:"calc(100vh - 52px)",overflow:"hidden"}}>
+      {/* ── Assign Customer Modal ── */}
+      {showAssign && assignChat && (
+        <div style={{position:"fixed",inset:0,background:"#000a",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>setShowAssign(false)}>
+          <div style={{background:"var(--bg2)",border:"1px solid var(--border)",borderRadius:"var(--r)",width:560,maxHeight:"80vh",overflow:"auto",padding:24}} onClick={e=>e.stopPropagation()}>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20}}>
+              <div>
+                <div style={{fontFamily:"var(--fh)",fontWeight:700,fontSize:16}}>Assign Customer</div>
+                <div style={{fontSize:12,color:"var(--text2)",marginTop:2}}>{assignChat.name} · {assignChat.id}</div>
+              </div>
+              <button className="btn btn-ghost btn-sm" onClick={()=>setShowAssign(false)}>✕</button>
+            </div>
+
+            {assignLoading && <div style={{color:"var(--text2)",fontSize:13,marginBottom:12}}>Loading customers...</div>}
+
+            {/* Individual chat assignment */}
+            {!assignChat.id?.endsWith("@g.us") && (
+              <div>
+                <div style={{fontSize:11,textTransform:"uppercase",letterSpacing:1,color:"var(--text2)",fontWeight:700,marginBottom:10}}>Assign to Customer</div>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:16}}>
+                  <div>
+                    <label style={{fontSize:11,color:"var(--text2)",display:"block",marginBottom:4}}>CUSTOMER</label>
+                    <select className="form-input" value={assignments[assignChat.id]?.store_id||""}
+                      onChange={e=>{
+                        const c = customers.find(x=>x.store_id===e.target.value);
+                        if(c) saveAssignment(assignChat.id,null,"customer",c.label,{store_id:c.store_id,customer_id:c.id,branches:c.branches});
+                      }}>
+                      <option value="">— Select Customer —</option>
+                      {customers.map(c=><option key={c.id} value={c.store_id}>{c.label}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label style={{fontSize:11,color:"var(--text2)",display:"block",marginBottom:4}}>BRANCH</label>
+                    <select className="form-input" value={assignments[assignChat.id]?.branch_id||""}
+                      onChange={e=>{
+                        const branches = assignments[assignChat.id]?.branches||[];
+                        const b = branches.find(x=>x.branch_id===e.target.value);
+                        if(b) saveAssignment(assignChat.id,null,"branch",b.branch_name,{branch_id:b.branch_id});
+                      }}>
+                      <option value="">— Select Branch —</option>
+                      {(assignments[assignChat.id]?.branches||[]).map(b=><option key={b.branch_id} value={b.branch_id}>{b.branch_name}</option>)}
+                    </select>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Group chat — assign per member */}
+            {assignChat.id?.endsWith("@g.us") && (
+              <div>
+                <div style={{fontSize:11,textTransform:"uppercase",letterSpacing:1,color:"var(--text2)",fontWeight:700,marginBottom:10}}>
+                  Assign Customers to Members
+                </div>
+                {(groupMembers[assignChat.id]||[]).length === 0 && (
+                  <div style={{color:"var(--text2)",fontSize:12,padding:"20px",textAlign:"center",border:"1px dashed var(--border)",borderRadius:"var(--r2)"}}>
+                    Loading group members... (requires Whapi group endpoint)
+                  </div>
+                )}
+                {(groupMembers[assignChat.id]||[]).map((m,i)=>(
+                  <div key={m.id} style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,padding:"10px 0",borderBottom:"1px solid var(--border)",alignItems:"center"}}>
+                    <div style={{display:"flex",alignItems:"center",gap:8}}>
+                      <div className={`wa-avatar ${getAV(i)}`} style={{width:28,height:28,fontSize:10,borderRadius:"50%"}}>{(m.name||"?")[0]}</div>
+                      <div>
+                        <div style={{fontWeight:600,fontSize:12}}>{m.name}</div>
+                        <div style={{fontSize:10,color:"var(--text2)"}}>{m.phone}</div>
+                      </div>
+                    </div>
+                    <select className="form-input" style={{fontSize:11,padding:"5px 8px"}} value={assignments[m.id]?.store_id||""}
+                      onChange={e=>{
+                        const c=customers.find(x=>x.store_id===e.target.value);
+                        if(c) saveAssignment(null,m.id,"customer",c.label,{store_id:c.store_id,branches:c.branches});
+                      }}>
+                      <option value="">— Customer —</option>
+                      {customers.map(c=><option key={c.id} value={c.store_id}>{c.label}</option>)}
+                    </select>
+                    <select className="form-input" style={{fontSize:11,padding:"5px 8px"}} value={assignments[m.id]?.branch_id||""}
+                      onChange={e=>{
+                        const branches=assignments[m.id]?.branches||[];
+                        const b=branches.find(x=>x.branch_id===e.target.value);
+                        if(b) saveAssignment(null,m.id,"branch",b.branch_name,{branch_id:b.branch_id});
+                      }}>
+                      <option value="">— Branch —</option>
+                      {(assignments[m.id]?.branches||[]).map(b=><option key={b.branch_id} value={b.branch_id}>{b.branch_name}</option>)}
+                    </select>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div style={{display:"flex",gap:10,marginTop:20,justifyContent:"flex-end"}}>
+              <button className="btn btn-ghost" onClick={()=>setShowAssign(false)}>Cancel</button>
+              <button className="btn btn-primary" onClick={confirmAssignment}>✓ Save Assignment</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Connection banner */}
       {!wapiOk && (
         <div style={{padding:"10px 20px",background:"#f59e0b15",borderBottom:"1px solid #f59e0b30",display:"flex",alignItems:"center",gap:10,fontSize:12,color:"var(--warn)",flexShrink:0}}>
@@ -1170,14 +1350,44 @@ function WhatsAppScreen({ conn = {} }) {
             <div className="wa-header">
               <div className={`wa-avatar ${getAV(chats.findIndex(c=>c.id===cur.id))}`} style={{width:36,height:36,fontSize:12}}>{cur.avatar}</div>
               <div style={{flex:1}}>
-                <div style={{fontWeight:700,fontSize:14}}>{cur.name}</div>
-                <div style={{fontSize:11,color:"var(--accent)"}}>{cur.online?"● Online":"Last seen recently"}</div>
+                <div style={{display:"flex",alignItems:"center",gap:8}}>
+                  <div style={{fontWeight:700,fontSize:14}}>{cur.name}</div>
+                  {cur.id?.endsWith("@g.us") && <span style={{fontSize:10,background:"#7c4dff22",color:"#a78bfa",padding:"2px 6px",borderRadius:10,fontWeight:700}}>GROUP</span>}
+                  {assignments[cur.id]?.customer && (
+                    <span style={{fontSize:10,background:"#00d9a320",color:"var(--accent)",padding:"2px 6px",borderRadius:10}}>
+                      👤 {assignments[cur.id].customer}
+                    </span>
+                  )}
+                </div>
+                <div style={{fontSize:11,color:"var(--text2)",marginTop:2}}>
+                  {cur.id?.endsWith("@g.us")
+                    ? `${(groupMembers[cur.id]||[]).length || "?"} members`
+                    : (cur.online ? "● Online" : "Last seen recently")}
+                  {assignments[cur.id]?.branch && <span style={{marginLeft:8,color:"#60a5fa"}}>📍 {assignments[cur.id].branch}</span>}
+                </div>
               </div>
-              <div style={{fontSize:11,color:"var(--text2)",marginRight:4}}>{cur.phone || (wapiPhoneNumber ? `+${wapiPhoneNumber}` : "")}</div>
-              <button className="btn btn-ghost btn-sm" onClick={()=>fetchMessages(cur.id)} title="Refresh messages">↻</button>
-              <button className="btn btn-ghost btn-sm">📋 Profile</button>
+              <button className="btn btn-ghost btn-sm" onClick={()=>fetchMessages(cur.id)} title="Refresh">↻</button>
+              <button className="btn btn-ghost btn-sm" style={{background:"#f59e0b15",color:"var(--warn)",border:"1px solid #f59e0b30"}}
+                onClick={()=>openAssignModal(cur)}>
+                + Assign Customer
+              </button>
               <button className="btn btn-primary btn-sm">🛒 Create Order</button>
             </div>
+
+            {/* Group members strip */}
+            {cur.id?.endsWith("@g.us") && groupMembers[cur.id]?.length > 0 && (
+              <div style={{padding:"8px 16px",background:"#7c4dff0a",borderBottom:"1px solid var(--border)",display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
+                <span style={{fontSize:10,color:"#a78bfa",fontWeight:700,textTransform:"uppercase",letterSpacing:1}}>Members:</span>
+                {groupMembers[cur.id].map((m,i) => (
+                  <div key={m.id} style={{display:"flex",alignItems:"center",gap:4,background:"var(--bg3)",borderRadius:20,padding:"3px 10px",fontSize:11,border:"1px solid var(--border)"}}>
+                    <div className={`wa-avatar ${getAV(i)}`} style={{width:18,height:18,fontSize:8,borderRadius:"50%",flexShrink:0}}>{(m.name||"?")[0]}</div>
+                    <span style={{fontWeight:600}}>{m.name}</span>
+                    {m.role==="creator"&&<span style={{color:"#f59e0b",fontSize:9}}>★</span>}
+                    {assignments[m.id]?.customer && <span style={{color:"var(--accent)",fontSize:9}}>✓ {assignments[m.id].customer}</span>}
+                  </div>
+                ))}
+              </div>
+            )}
 
             <div className="wa-messages">
               {cur.messages.map(m=>(
