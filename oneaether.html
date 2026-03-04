@@ -40,7 +40,7 @@
 <div id="agent-banner">
   <div class="dot" id="agent-dot"></div>
   <span>Backend:</span>
-  <input id="agent-url-input" type="text" placeholder="https://your-app.railway.app" onfocus="if(!this.value)this.value=window.AGENT_URL" 
+  <input id="agent-url-input" type="text" placeholder="https://your-app.railway.app" value="https://oneaether-agent-production.up.railway.app" onfocus="if(!this.value)this.value=window.AGENT_URL" 
          
          onchange="updateAgentUrl(this.value)"/>
   <button onclick="testAgent()">Test</button>
@@ -49,7 +49,7 @@
 <script>
   // Global agent URL — UI reads this
   // Auto-detect: if served from Railway, backend is same origin
-  window.AGENT_URL = window.location.origin;
+  window.AGENT_URL = "https://oneaether-agent-production.up.railway.app";
   
   function updateAgentUrl(url) {
     window.AGENT_URL = url.trim();
@@ -1292,25 +1292,34 @@ function ConnectScreen({ defaultTab = "erp", conn, setConn }) {
       console.log('Attempting login at:', loginUrl);
 
       let data = null;
+      const _agUrl = (conn.agentUrl || window.AGENT_URL || "").replace(/\/+$/, "");
 
-      // 1st attempt: direct browser → SNC
-      try {
-        const res = await fetch(loginUrl, { method: "POST", body: fd });
-        if (res.status === 405) throw new Error("405_METHOD");
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        data = await res.json();
-      } catch(directErr) {
-        console.warn("Direct login failed:", directErr.message, "— trying via backend proxy");
-        // 2nd attempt: proxy through our Railway backend
-        const _agUrl = conn.agentUrl || window.AGENT_URL || "";
-        if (!_agUrl) throw new Error(`Login failed (${directErr.message}). Make sure your API URL is correct: https://dev2.snc.delivernchill.com/api`);
-        const proxyRes = await fetch(`${_agUrl}/proxy/snc/login`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ api_url: loginUrl, username: erpUsername, password: erpPassword })
-        });
-        if (!proxyRes.ok) throw new Error(`Login failed — HTTP ${proxyRes.status}. Check your API URL and credentials.`);
-        data = await proxyRes.json();
+      // Always go via Railway backend proxy (avoids CORS completely)
+      if (_agUrl) {
+        console.log("Logging in via backend proxy:", _agUrl);
+        try {
+          const proxyRes = await fetch(`${_agUrl}/proxy/snc/login`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ api_url: loginUrl, username: erpUsername, password: erpPassword })
+          });
+          const proxyData = await proxyRes.json();
+          if (!proxyRes.ok) throw new Error(proxyData.detail || `HTTP ${proxyRes.status}`);
+          data = proxyData;
+          console.log("Proxy login success:", data.access_token ? "got token" : "no token");
+        } catch(proxyErr) {
+          throw new Error(`Login failed: ${proxyErr.message}`);
+        }
+      } else {
+        // No backend URL set — try direct (may fail due to CORS)
+        console.warn("No backend URL set — trying direct (may fail due to CORS)");
+        try {
+          const res = await fetch(loginUrl, { method: "POST", body: fd });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          data = await res.json();
+        } catch(e) {
+          throw new Error(`Login failed: ${e.message}. Set your Railway backend URL in the bottom-right corner first!`);
+        }
       }
 
       if (data && data.access_token) {
@@ -1733,7 +1742,7 @@ function App() {
     wapiUrl:      "https://gate.whapi.cloud",
     wapiToken:    "", wapiChannelId: "", wapiPhoneNumber: "",
     wapiOk:       false,
-    agentUrl:     "http://158.140.133.82:8000",
+    agentUrl:     "https://oneaether-agent-production.up.railway.app",
     webhookSecret:"",
   });
 
