@@ -1407,17 +1407,22 @@ function WhatsAppScreen({ conn = {} }) {
                           method: "POST",
                           headers: {"Content-Type":"application/json"},
                           body: JSON.stringify({
-                            chat_id:       createOrderChat.id,
+                            chat_id:       String(createOrderChat.id),
                             items:         orderItems.filter(x=>x.name.trim()),
                             delivery_date: orderDelivery,
-                            sender_name:   createOrderChat.name,
+                            sender_name:   createOrderChat.name || "",
                           })
                         });
-                        const data = await res.json();
+                        const raw = await res.text();
+                        let data = {};
+                        try { data = JSON.parse(raw); } catch(_) {
+                          setOrderResult({success:false, error: "Server error: " + raw.slice(0,200)});
+                          return;
+                        }
                         if (res.ok && data.order_number) {
                           setOrderResult({success:true, order_number: data.order_number});
                         } else {
-                          setOrderResult({success:false, error: data.detail || data.error || "Order creation failed"});
+                          setOrderResult({success:false, error: data.detail || data.error || "Order failed (HTTP "+res.status+")"});
                         }
                       } catch(e) {
                         setOrderResult({success:false, error: e.message});
