@@ -423,8 +423,20 @@ async def sync_products_from_snc(page: int = 1, per_page: int = 100) -> int:
         "include_columns": ["name","sku","prices","uom","uom_id","item_id","tax_code","tax_code_id","tax_rate"],
         "merged": True, "bundles": False,
     }}})
-    if not result: return 0
-    products = result.get("result", {}).get("data", [])
+    if not result:
+        logger.error("sync_products: snc_call returned None")
+        return 0
+    r = result.get("result", {})
+    meta = r.get("metadata", {})
+    # Try all known SNC response paths
+    products = (
+        meta.get("ProductList") or meta.get("products") or meta.get("Items") or
+        r.get("data", {}).get("ProductList") if isinstance(r.get("data"), dict) else None or
+        (r.get("data") if isinstance(r.get("data"), list) else None) or
+        r.get("ProductList") or r.get("products") or []
+    )
+    if not isinstance(products, list): products = []
+    logger.info("sync_products page=%d found=%d meta_keys=%s", page, len(products), list(meta.keys()))
     if products:
         db_upsert_products(products)
     return len(products)
@@ -585,7 +597,8 @@ async def push_order_to_snc(items: List[Dict], chat_id: str, delivery_date: str,
     item_total = 0.0
     tax_total  = 0.0
     for it in items:
-        if not it.get("found") or not it.get("item_id"): continue
+        if not it.get("found"): continue
+        # Allow empty item_id — SNC may match by SKU/name
         qty        = it.get("qty",1)
         price      = it.get("price",0)
         tax_rate   = it.get("tax_rate",9)
@@ -619,10 +632,19 @@ async def push_order_to_snc(items: List[Dict], chat_id: str, delivery_date: str,
         })
     if not item_info: return None
 
-    result = await snc_call("/b2b/order/save", {"data": {
+    # Get slot_info from SNC (required field) — use default if not available
+    slot_info = {
+        "slot_id": None, "delivery_type": "Delivery",
+        "cut_off_name": "Morning - 9:00 am", "cut_off_period": "09:00",
+        "start_period": None, "end_period": None, "default": True,
+    }
+
+    order_payload = {
         "company_id": company_id, "source": "B2B", "platform": "Whatsapp",
         "store_id": store_id, "store": store,
-        "branch_id": branch_id, "branch_name": branch_name,
+        "branch_id": branch_id if branch_id != "main" else "",
+        "branch_name": branch_name,
+        "slot_info": slot_info,
         "currency": "SGD", "items_count": len(item_info),
         "order_status": "Pending", "paid_status": "Pending",
         "delivery_type": "Delivery", "delivery_date": delivery,
@@ -637,7 +659,11 @@ async def push_order_to_snc(items: List[Dict], chat_id: str, delivery_date: str,
         "advance_amount": 0, "delivery_charges": 0, "tax_inclusive": False,
         "installation_info": {"installation":False,"installation_date":None,"installation_charges":0},
         "whatsapp_contact_id": chat_id,
-    }})
+    }
+    logger.info("push_order payload: store_id=%s branch_id=%s items=%d total=%.2f",
+                store_id, branch_id, len(item_info), round(item_total+tax_total,2))
+
+    result = await snc_call("/b2b/order/save", {"data": order_payload})
     if result:
         order_num = result.get("result",{}).get("order_number") or result.get("order_number")
         logger.info("Order created: %s", order_num)
@@ -762,6 +788,29 @@ async def serve_frontend():
     html_file = Path(__file__).parent / "oneaether.html"
     if html_file.exists(): return HTMLResponse(content=html_file.read_text())
     return HTMLResponse(content="<h2>✓ oneaether.ai running</h2>")
+
+@app.get("/debug/products-test")
+async def debug_products_test():
+    """Test SNC products fetch — see raw response structure."""
+    result = await snc_call("/products/list", {"data": {"filter_by": {
+        "search_text": [], "search_on": ["name","sku"],
+        "confidence": 0.0, "exact_match": False,
+        "pagination": {"page_no": 1, "no_of_recs": 3, "sort_by": "cts", "order_by": False},
+        "view": "individual", "status": "Active",
+        "include_columns": ["name","sku","prices","uom","uom_id","item_id"],
+        "merged": True, "bundles": False,
+    }}})
+    if not result:
+        return {"error": "snc_call returned None — check token/user_id"}
+    r = result.get("result", {})
+    meta = r.get("metadata", {})
+    return {
+        "result_keys":  list(r.keys()),
+        "metadata_keys": list(meta.keys()),
+        "data_type":    str(type(r.get("data"))),
+        "sample":       str(result)[:800],
+    }
+
 
 @app.get("/debug/order-test/{chat_id:path}")
 async def debug_order_test(chat_id: str):
