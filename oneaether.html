@@ -1999,7 +1999,22 @@ function ConnectScreen({ defaultTab = "erp", conn, setConn }) {
                       setErpLastSync(new Date().toLocaleString());
                       const _ag = conn.agentUrl || window.AGENT_URL || "";
                       if(_ag) fetch(_ag+"/credentials",{method:"POST",headers:{"Content-Type":"application/json"},
-                        body:JSON.stringify({snc:{api_url:erpApiUrl,access_token:erpToken,company_id:erpCompanyId,username:erpUsername,timezone:erpTimezone}})}).catch(()=>{});
+                        body:JSON.stringify({snc:{
+                            api_url:      erpApiUrl,
+                            access_token: erpToken,
+                            company_id:   erpCompanyId || "mindmasters",
+                            username:     erpUsername,
+                            timezone:     erpTimezone || "Asia/Singapore",
+                            user_id:      erpUserId || "",
+                          }})}).then(async()=>{
+                            const _ag2 = conn.agentUrl || window.AGENT_URL || "";
+                            try {
+                              const r = await fetch(_ag2+"/resolve-user");
+                              const d = await r.json();
+                              if(d.user_id) setConn(c=>({...c,erpUserId:d.user_id,erpUsername:d.username||c.erpUsername}));
+                              console.log("Resolved user_id:", d);
+                            } catch(e){ console.warn("resolve-user:", e); }
+                          }).catch(()=>{});
                     }}>
                     ✓ Use Token
                   </button>
