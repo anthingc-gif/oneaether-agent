@@ -281,34 +281,64 @@ def snc_base():
 def whapi_headers():
     return {"Authorization": f"Bearer {credentials['whapi'].get('token','')}", "Content-Type": "application/json"}
 
-async def poll_job(job_id: str, timeout: int = 20) -> Optional[Dict]:
+async def poll_job(job_id: str, timeout: int = 30) -> Optional[Dict]:
     api_url = credentials["snc"].get("api_url","")
     if not api_url: return None
     deadline = time.time() + timeout
     async with httpx.AsyncClient(timeout=10) as client:
+        attempt = 0
         while time.time() < deadline:
+            attempt += 1
             try:
                 resp = await client.get(f"{api_url}/job/{job_id}", headers=snc_headers())
                 data = resp.json()
-                if data.get("process_status") == "processed" or data.get("result"):
+                process_status = data.get("process_status","")
+                logger.info("poll_job %s attempt=%d status=%s", job_id, attempt, process_status)
+                if process_status == "processed" or data.get("result") is not None:
                     return data
-                await asyncio.sleep(1.5)
-            except Exception:
                 await asyncio.sleep(2)
+            except Exception as e:
+                logger.warning("poll_job %s error: %s", job_id, e)
+                await asyncio.sleep(2)
+    logger.error("poll_job %s timed out after %ds", job_id, timeout)
     return None
 
 async def snc_call(endpoint: str, body: Dict) -> Optional[Dict]:
     api_url = credentials["snc"].get("api_url","")
-    if not api_url or not credentials["snc"].get("access_token"): return None
+    token   = credentials["snc"].get("access_token","")
+    if not api_url or not token:
+        logger.error("snc_call %s: missing api_url or token", endpoint)
+        return None
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(f"{api_url}{endpoint}", json={**snc_base(), **body}, headers=snc_headers())
+            resp = await client.post(
+                f"{api_url}{endpoint}",
+                json={**snc_base(), **body},
+                headers=snc_headers()
+            )
+            logger.info("snc_call %s → HTTP %s", endpoint, resp.status_code)
+            if resp.status_code not in (200, 201):
+                logger.error("snc_call %s failed: %s", endpoint, resp.text[:300])
+                return None
             data = resp.json()
-            if not data.get("status", {}).get("success"): return None
+            status = data.get("status", {})
+            logger.info("snc_call %s status=%s job_id=%s", endpoint, status, data.get("job_id"))
+            # SNC returns job_id for async operations — poll for result
             job_id = data.get("job_id")
-            return await poll_job(job_id) if job_id else data
+            if job_id:
+                result = await poll_job(job_id)
+                logger.info("snc_call %s poll result keys=%s", endpoint, list(result.keys()) if result else None)
+                return result
+            # Some endpoints return result directly
+            if data.get("result") is not None:
+                return data
+            # If status.success is False, log and return None
+            if status and not status.get("success", True):
+                logger.error("snc_call %s: success=false msg=%s", endpoint, status.get("msg",""))
+                return None
+            return data
     except Exception as e:
-        logger.error("snc_call %s: %s", endpoint, e)
+        logger.error("snc_call %s exception: %s", endpoint, e)
         return None
 
 async def whapi_send(to: str, body: str) -> bool:
@@ -336,8 +366,19 @@ async def sync_customers_from_snc(page: int = 1, per_page: int = 100) -> int:
         "search_text": "", "exact_match": False,
         "pagination": {"page_no": page, "no_of_recs": per_page, "sort_by": "cts", "order_by": False},
     }}})
-    if not result: return 0
-    customers = result.get("result", {}).get("data", [])
+    if not result:
+        logger.error("sync_customers: snc_call returned None")
+        return 0
+    logger.info("sync_customers raw result keys: %s", list(result.keys()))
+    # Handle various response structures
+    r = result.get("result", result)
+    if isinstance(r, dict):
+        customers = r.get("data", r.get("customers", []))
+    elif isinstance(r, list):
+        customers = r
+    else:
+        customers = []
+    logger.info("sync_customers page=%d found=%d", page, len(customers))
     if customers:
         db_upsert_customers(customers)
     return len(customers)
@@ -930,14 +971,29 @@ async def proxy_whapi_messages(chat_id: str, page: int=1, count: int=40):
             return resp.json()
         except Exception as e: raise HTTPException(status_code=502, detail=str(e))
 
-@app.get("/proxy/whapi/group/{chat_id}")
+@app.get("/proxy/whapi/group/{chat_id:path}")
 async def proxy_whapi_group(chat_id: str):
-    base = credentials["whapi"].get("base_url","https://gate.whapi.cloud")
+    """Fetch group participants from Whapi."""
+    base  = credentials["whapi"].get("base_url", "https://gate.whapi.cloud")
+    token = credentials["whapi"].get("token", "")
+    if not token:
+        return {"participants": [], "error": "No Whapi token"}
     async with httpx.AsyncClient(timeout=15) as client:
         try:
             resp = await client.get(f"{base}/groups/{chat_id}", headers=whapi_headers())
-            return resp.json()
-        except Exception as e: raise HTTPException(status_code=502, detail=str(e))
+            logger.info("Whapi group %s → HTTP %s", chat_id, resp.status_code)
+            if resp.status_code == 200:
+                data = resp.json()
+                participants = data.get("participants", data.get("members", []))
+                return {"participants": participants, "raw": data}
+            resp2 = await client.get(f"{base}/chats/{chat_id}", headers=whapi_headers())
+            if resp2.status_code == 200:
+                data2 = resp2.json()
+                return {"participants": data2.get("participants", data2.get("members", [])), "raw": data2}
+            return {"participants": [], "error": f"HTTP {resp.status_code}"}
+        except Exception as e:
+            logger.error("Whapi group error: %s", e)
+            return {"participants": [], "error": str(e)}
 
 @app.post("/proxy/whapi/send")
 async def proxy_whapi_send(payload: SendMessagePayload):
