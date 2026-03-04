@@ -730,6 +730,53 @@ async def proxy_whapi_send(payload: SendMessagePayload):
         raise HTTPException(status_code=502, detail="Failed to send message")
     return {"status": "ok", "sent": True}
 
+@app.post("/proxy/snc/login")
+async def proxy_snc_login(request: Request):
+    """
+    Proxy the SNC login — fixes CORS and 405 issues when browser calls SNC directly.
+    """
+    body     = await request.json()
+    api_url  = body.get("api_url", "")
+    username = body.get("username", "")
+    password = body.get("password", "")
+
+    if not api_url or not username or not password:
+        raise HTTPException(status_code=400, detail="api_url, username and password required")
+
+    # Clean URL
+    api_url = api_url.rstrip("/")
+    if not api_url.endswith("/api"):
+        if "/api/" in api_url:
+            api_url = api_url.split("/api/")[0] + "/api"
+        else:
+            api_url = api_url + "/api"
+
+    login_url = f"{api_url}/login"
+    logger.info(f"Proxying SNC login → {login_url}")
+
+    fd = {"username": username, "password": password, "grant_type": "password", "notification": "false"}
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post(login_url, data=fd)
+            data = resp.json()
+            logger.info(f"SNC login response: {resp.status_code} — has_token={bool(data.get('access_token'))}")
+            if resp.status_code not in (200, 201):
+                raise HTTPException(status_code=resp.status_code, detail=data.get("detail", f"SNC returned {resp.status_code}"))
+            # Store credentials in agent memory
+            if data.get("access_token"):
+                credentials["snc"]["api_url"]      = api_url
+                credentials["snc"]["access_token"]  = data["access_token"]
+                credentials["snc"]["user_id"]       = data.get("user_id", "")
+                credentials["snc"]["username"]      = username
+            return data
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"SNC login proxy error: {e}")
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 @app.post("/proxy/snc/customers")
 async def proxy_snc_customers(request: Request):
     body = await request.json()
