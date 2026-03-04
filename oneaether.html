@@ -1284,17 +1284,43 @@ function ConnectScreen({ defaultTab = "erp", conn, setConn }) {
       fd.append("password", erpPassword);
       fd.append("grant_type", "password");
       fd.append("notification", "false");
-      const res = await fetch(`${erpApiUrl}/login`, { method: "POST", body: fd });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      if (data.access_token) {
+      // Clean URL — strip trailing slash, ensure /api is present
+      const cleanUrl = erpApiUrl.replace(/\/+$/, '');
+      const loginUrl = cleanUrl.endsWith('/api') ? `${cleanUrl}/login`
+                     : cleanUrl.includes('/api/') ? `${cleanUrl.split('/api/')[0]}/api/login`
+                     : `${cleanUrl}/api/login`;
+      console.log('Attempting login at:', loginUrl);
+
+      let data = null;
+
+      // 1st attempt: direct browser → SNC
+      try {
+        const res = await fetch(loginUrl, { method: "POST", body: fd });
+        if (res.status === 405) throw new Error("405_METHOD");
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        data = await res.json();
+      } catch(directErr) {
+        console.warn("Direct login failed:", directErr.message, "— trying via backend proxy");
+        // 2nd attempt: proxy through our Railway backend
+        const _agUrl = conn.agentUrl || window.AGENT_URL || "";
+        if (!_agUrl) throw new Error(`Login failed (${directErr.message}). Make sure your API URL is correct: https://dev2.snc.delivernchill.com/api`);
+        const proxyRes = await fetch(`${_agUrl}/proxy/snc/login`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ api_url: loginUrl, username: erpUsername, password: erpPassword })
+        });
+        if (!proxyRes.ok) throw new Error(`Login failed — HTTP ${proxyRes.status}. Check your API URL and credentials.`);
+        data = await proxyRes.json();
+      }
+
+      if (data && data.access_token) {
         const ts = new Date().toLocaleString();
         setConn(c => ({ ...c, erpToken: data.access_token, erpUserId: data.user_id || "", erpOk: true, erpLastSync: ts }));
         // Sync credentials to backend agent
-        const _agUrl = conn.agentUrl || window.AGENT_URL || "http://158.140.133.82:8000";
+        const _agUrl = conn.agentUrl || window.AGENT_URL || "";
         try { await fetch(_agUrl+"/credentials",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({snc:{api_url:erpApiUrl,access_token:data.access_token,user_id:data.user_id||"",username:erpUsername,company_id:erpCompanyId,timezone:erpTimezone}})}); } catch(_){}
       } else {
-        throw new Error(data.detail || "Login failed — check credentials");
+        throw new Error((data && data.detail) || "Login failed — check your username and password");
       }
     } catch (e) {
       setErpError(e.message || "Connection failed");
