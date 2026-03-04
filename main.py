@@ -1,6 +1,8 @@
 """
-oneaether.ai Agent Server - Railway Edition
-AI-powered WhatsApp order intent detection & processing
+oneaether.ai Agent Server
+- SQLite database for persistent storage
+- Live customer/product/order sync from SellnChill
+- WhatsApp intent detection + order creation
 """
 
 import asyncio
@@ -8,6 +10,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -23,10 +26,180 @@ from pydantic import BaseModel
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("oneaether")
 
+# ─── Database ─────────────────────────────────────────────────────────────────
+DB_PATH = os.getenv("DB_PATH", "/app/oneaether.db")
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    db = get_db()
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS credentials (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            uts   TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS customers (
+            customer_id   TEXT PRIMARY KEY,
+            store_id      TEXT,
+            customer_name TEXT,
+            phone         TEXT,
+            email         TEXT,
+            store         TEXT,
+            branch_id     TEXT,
+            branch_name   TEXT,
+            address       TEXT,
+            credit_term   TEXT,
+            status        TEXT DEFAULT 'Active',
+            raw           TEXT,
+            synced_at     TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS products (
+            item_id     TEXT PRIMARY KEY,
+            sku         TEXT,
+            name        TEXT,
+            uom         TEXT,
+            uom_id      TEXT,
+            price       REAL DEFAULT 0,
+            tax_rate    REAL DEFAULT 9,
+            tax_code    TEXT DEFAULT 'SR9',
+            tax_code_id TEXT,
+            status      TEXT DEFAULT 'Active',
+            raw         TEXT,
+            synced_at   TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS orders (
+            order_id      TEXT PRIMARY KEY,
+            order_number  TEXT UNIQUE,
+            customer_id   TEXT,
+            store_id      TEXT,
+            status        TEXT,
+            total_amount  REAL DEFAULT 0,
+            delivery_date TEXT,
+            chat_id       TEXT,
+            raw           TEXT,
+            synced_at     TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS chat_assignments (
+            chat_id     TEXT PRIMARY KEY,
+            customer_id TEXT,
+            customer    TEXT,
+            store_id    TEXT,
+            branch_id   TEXT,
+            branch      TEXT,
+            updated_at  TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS conversation_log (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id    TEXT,
+            role       TEXT,
+            message    TEXT,
+            intent     TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+    """)
+    db.commit()
+    db.close()
+    logger.info("Database initialised at %s", DB_PATH)
+
+def db_set_credential(key: str, value: str):
+    db = get_db()
+    db.execute("INSERT OR REPLACE INTO credentials(key,value,uts) VALUES(?,?,datetime('now'))", (key, value))
+    db.commit(); db.close()
+
+def db_get_credential(key: str) -> Optional[str]:
+    db = get_db()
+    row = db.execute("SELECT value FROM credentials WHERE key=?", (key,)).fetchone()
+    db.close()
+    return row["value"] if row else None
+
+def db_load_all_credentials() -> Dict:
+    db = get_db()
+    rows = db.execute("SELECT key,value FROM credentials").fetchall()
+    db.close()
+    return {r["key"]: r["value"] for r in rows}
+
+def db_save_assignment(chat_id: str, data: Dict):
+    db = get_db()
+    db.execute("""INSERT OR REPLACE INTO chat_assignments
+        (chat_id,customer_id,customer,store_id,branch_id,branch,updated_at)
+        VALUES(?,?,?,?,?,?,datetime('now'))""",
+        (chat_id, data.get("customer_id",""), data.get("customer",""),
+         data.get("store_id",""), data.get("branch_id",""), data.get("branch","")))
+    db.commit(); db.close()
+
+def db_get_assignment(chat_id: str) -> Optional[Dict]:
+    db = get_db()
+    row = db.execute("SELECT * FROM chat_assignments WHERE chat_id=?", (chat_id,)).fetchone()
+    db.close()
+    return dict(row) if row else None
+
+def db_get_all_assignments() -> Dict:
+    db = get_db()
+    rows = db.execute("SELECT * FROM chat_assignments").fetchall()
+    db.close()
+    return {r["chat_id"]: dict(r) for r in rows}
+
+def db_log_message(chat_id: str, role: str, message: str, intent: str = ""):
+    db = get_db()
+    db.execute("INSERT INTO conversation_log(chat_id,role,message,intent) VALUES(?,?,?,?)",
+               (chat_id, role, message, intent))
+    db.commit(); db.close()
+
+def db_upsert_customers(customers: List[Dict]):
+    db = get_db()
+    for c in customers:
+        db.execute("""INSERT OR REPLACE INTO customers
+            (customer_id,store_id,customer_name,phone,email,store,branch_id,branch_name,address,credit_term,status,raw,synced_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))""",
+            (c.get("customer_id",""), c.get("store_id",""), c.get("customer_name",""),
+             c.get("phone",""), c.get("email",""), c.get("store",""),
+             c.get("branch_id",""), c.get("branch_name",""),
+             json.dumps(c.get("address",{})), c.get("credit_term",""),
+             c.get("status","Active"), json.dumps(c)))
+    db.commit(); db.close()
+    logger.info("Upserted %d customers", len(customers))
+
+def db_upsert_products(products: List[Dict]):
+    db = get_db()
+    for p in products:
+        prices = p.get("prices", [])
+        price  = prices[0].get("price", 0) if prices else 0
+        db.execute("""INSERT OR REPLACE INTO products
+            (item_id,sku,name,uom,uom_id,price,tax_rate,tax_code,tax_code_id,status,raw,synced_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,datetime('now'))""",
+            (p.get("item_id",""), p.get("sku",""), p.get("name",""),
+             p.get("uom",""), p.get("uom_id",""), price,
+             p.get("tax_rate",9), p.get("tax_code","SR9"),
+             p.get("tax_code_id",""), p.get("status","Active"), json.dumps(p)))
+    db.commit(); db.close()
+    logger.info("Upserted %d products", len(products))
+
+def db_upsert_orders(orders: List[Dict]):
+    db = get_db()
+    for o in orders:
+        db.execute("""INSERT OR REPLACE INTO orders
+            (order_id,order_number,customer_id,store_id,status,total_amount,delivery_date,chat_id,raw,synced_at)
+            VALUES(?,?,?,?,?,?,?,?,?,datetime('now'))""",
+            (o.get("order_id",""), o.get("order_number",""),
+             o.get("customer_id",""), o.get("store_id",""),
+             o.get("order_status",""), o.get("total_amount",0),
+             o.get("delivery_date",""), o.get("whatsapp_contact_id",""),
+             json.dumps(o)))
+    db.commit(); db.close()
+
 # ─── Global state ─────────────────────────────────────────────────────────────
 credentials: Dict[str, Any] = {
     "snc": {
-        "api_url":      os.getenv("SNC_API_URL", ""),
+        "api_url":      os.getenv("SNC_API_URL", "https://enterprise.sellnchill.com/api"),
         "access_token": os.getenv("SNC_TOKEN", ""),
         "user_id":      os.getenv("SNC_USER_ID", ""),
         "username":     os.getenv("SNC_USERNAME", ""),
@@ -39,30 +212,46 @@ credentials: Dict[str, Any] = {
         "channel_id": os.getenv("WHAPI_CHANNEL_ID", ""),
     },
     "agent": {
-        "enabled":        os.getenv("AGENT_ENABLED", "true").lower() == "true",
-        "anthropic_key":  os.getenv("ANTHROPIC_API_KEY", ""),
-        "openai_key":     os.getenv("OPENAI_API_KEY", ""),
+        "enabled":       os.getenv("AGENT_ENABLED", "true").lower() == "true",
+        "anthropic_key": os.getenv("ANTHROPIC_API_KEY", ""),
+        "openai_key":    os.getenv("OPENAI_API_KEY", ""),
     }
 }
 
-# Conversation memory: chat_id -> last few messages for context
 conversation_memory: Dict[str, List[Dict]] = {}
+
+def load_credentials_from_db():
+    """Load persisted credentials from DB into memory on startup."""
+    try:
+        saved = db_load_all_credentials()
+        if saved.get("snc_api_url"):      credentials["snc"]["api_url"]      = saved["snc_api_url"]
+        if saved.get("snc_token"):        credentials["snc"]["access_token"]  = saved["snc_token"]
+        if saved.get("snc_user_id"):      credentials["snc"]["user_id"]       = saved["snc_user_id"]
+        if saved.get("snc_username"):     credentials["snc"]["username"]      = saved["snc_username"]
+        if saved.get("snc_company_id"):   credentials["snc"]["company_id"]    = saved["snc_company_id"]
+        if saved.get("whapi_token"):      credentials["whapi"]["token"]       = saved["whapi_token"]
+        if saved.get("whapi_base_url"):   credentials["whapi"]["base_url"]    = saved["whapi_base_url"]
+        if saved.get("whapi_channel_id"): credentials["whapi"]["channel_id"]  = saved["whapi_channel_id"]
+        if saved.get("anthropic_key"):    credentials["agent"]["anthropic_key"]= saved["anthropic_key"]
+        if saved.get("openai_key"):       credentials["agent"]["openai_key"]  = saved["openai_key"]
+        logger.info("Credentials loaded from DB")
+    except Exception as e:
+        logger.warning("Could not load credentials from DB: %s", e)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    init_db()
+    load_credentials_from_db()
     logger.info("oneaether.ai starting on port %s", os.getenv("PORT", 8000))
-    logger.info("AI Agent: %s", "ENABLED" if credentials["agent"]["enabled"] else "DISABLED")
-    if credentials["agent"]["anthropic_key"]:
-        logger.info("AI Provider: Claude (Anthropic)")
-    elif credentials["agent"]["openai_key"]:
-        logger.info("AI Provider: OpenAI GPT-4o-mini")
-    else:
-        logger.info("AI Provider: rule-based fallback (no API key set)")
+    logger.info("Agent: %s | AI: %s",
+        "ON" if credentials["agent"]["enabled"] else "OFF",
+        "Claude" if credentials["agent"]["anthropic_key"] else
+        "OpenAI" if credentials["agent"]["openai_key"] else "rule-based")
     yield
-    logger.info("oneaether.ai shutting down")
 
 app = FastAPI(title="oneaether.ai", version="1.0.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
+                   allow_methods=["*"], allow_headers=["*"])
 
 # ─── Pydantic models ──────────────────────────────────────────────────────────
 class CredentialsPayload(BaseModel):
@@ -75,7 +264,6 @@ class SendMessagePayload(BaseModel):
     body:         str
     type:         str = "text"
     phone_number: Optional[str] = None
-    mentions:     Optional[List[str]] = None
 
 # ─── SNC helpers ──────────────────────────────────────────────────────────────
 def snc_headers():
@@ -83,22 +271,21 @@ def snc_headers():
 
 def snc_base():
     return {
-        "company_id":   credentials["snc"].get("company_id", ""),
-        "user_id":      credentials["snc"].get("user_id", ""),
-        "username":     credentials["snc"].get("username", ""),
-        "timezone":     credentials["snc"].get("timezone", "Asia/Singapore"),
+        "company_id":   credentials["snc"].get("company_id",""),
+        "user_id":      credentials["snc"].get("user_id",""),
+        "username":     credentials["snc"].get("username",""),
+        "timezone":     credentials["snc"].get("timezone","Asia/Singapore"),
         "request_from": "WEB",
     }
 
 def whapi_headers():
     return {"Authorization": f"Bearer {credentials['whapi'].get('token','')}", "Content-Type": "application/json"}
 
-async def poll_job(job_id: str, timeout: int = 30) -> Optional[Dict]:
-    api_url = credentials["snc"].get("api_url", "")
-    if not api_url:
-        return None
+async def poll_job(job_id: str, timeout: int = 20) -> Optional[Dict]:
+    api_url = credentials["snc"].get("api_url","")
+    if not api_url: return None
     deadline = time.time() + timeout
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=10) as client:
         while time.time() < deadline:
             try:
                 resp = await client.get(f"{api_url}/job/{job_id}", headers=snc_headers())
@@ -106,1015 +293,697 @@ async def poll_job(job_id: str, timeout: int = 30) -> Optional[Dict]:
                 if data.get("process_status") == "processed" or data.get("result"):
                     return data
                 await asyncio.sleep(1.5)
-            except Exception as e:
-                logger.warning(f"Job poll error: {e}")
+            except Exception:
                 await asyncio.sleep(2)
     return None
 
 async def snc_call(endpoint: str, body: Dict) -> Optional[Dict]:
-    api_url = credentials["snc"].get("api_url", "")
-    if not api_url:
-        return None
+    api_url = credentials["snc"].get("api_url","")
+    if not api_url or not credentials["snc"].get("access_token"): return None
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(f"{api_url}{endpoint}", json={**snc_base(), **body}, headers=snc_headers())
             data = resp.json()
-            if not data.get("status", {}).get("success"):
-                logger.error(f"SNC error on {endpoint}: {data}")
-                return None
+            if not data.get("status", {}).get("success"): return None
             job_id = data.get("job_id")
             return await poll_job(job_id) if job_id else data
     except Exception as e:
-        logger.error(f"SNC call failed ({endpoint}): {e}")
+        logger.error("snc_call %s: %s", endpoint, e)
         return None
 
-async def send_whatsapp_reply(contact_id: str, message: str, phone_number: Optional[str] = None) -> bool:
-    api_url = credentials["snc"].get("api_url", "")
-    if not api_url:
-        logger.warning("Cannot send reply — SNC not configured")
+async def whapi_send(to: str, body: str) -> bool:
+    token    = credentials["whapi"].get("token","")
+    base_url = credentials["whapi"].get("base_url","https://gate.whapi.cloud")
+    if not token:
+        logger.error("whapi_send: no token")
         return False
-    payload = {**snc_base(), "data": {"contact_id": contact_id, "type": "text", "body": message,
-                                       **({"phone_number": phone_number} if phone_number else {})}}
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(f"{api_url}/whatsapp/messages/send", json=payload, headers=snc_headers())
-            return resp.json().get("status", {}).get("success", False)
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(f"{base_url}/messages/text",
+                json={"to": to, "body": body}, headers=whapi_headers())
+            ok = resp.status_code in (200,201) or resp.json().get("sent") or bool(resp.json().get("id"))
+            logger.info("whapi_send to=%s ok=%s", to, ok)
+            return ok
     except Exception as e:
-        logger.error(f"send_reply failed: {e}")
+        logger.error("whapi_send: %s", e)
         return False
+
+# ─── Sync functions ───────────────────────────────────────────────────────────
+async def sync_customers_from_snc(page: int = 1, per_page: int = 100) -> int:
+    """Pull all customers from SNC and store in DB."""
+    result = await snc_call("/customers/get", {"data": {"filter_by": {
+        "search_on": ["customer_name","customer_phone","customer_email"],
+        "search_text": "", "exact_match": False,
+        "pagination": {"page_no": page, "no_of_recs": per_page, "sort_by": "cts", "order_by": False},
+    }}})
+    if not result: return 0
+    customers = result.get("result", {}).get("data", [])
+    if customers:
+        db_upsert_customers(customers)
+    return len(customers)
+
+async def sync_products_from_snc(page: int = 1, per_page: int = 100) -> int:
+    """Pull all products from SNC and store in DB."""
+    result = await snc_call("/products/list", {"data": {"filter_by": {
+        "search_text": [], "search_on": ["name","sku"],
+        "confidence": 0.0, "exact_match": False,
+        "pagination": {"page_no": page, "no_of_recs": per_page, "sort_by": "cts", "order_by": False},
+        "view": "individual", "status": "Active",
+        "include_columns": ["name","sku","prices","uom","uom_id","item_id","tax_code","tax_code_id","tax_rate"],
+        "merged": True, "bundles": False,
+    }}})
+    if not result: return 0
+    products = result.get("result", {}).get("data", [])
+    if products:
+        db_upsert_products(products)
+    return len(products)
+
+async def sync_orders_from_snc(days: int = 30) -> int:
+    """Pull recent orders from SNC and store in DB."""
+    today     = datetime.now().strftime("%d-%m-%Y")
+    from_date = (datetime.now() - timedelta(days=days)).strftime("%d-%m-%Y")
+    result = await snc_call("/b2b/orders/get", {"data": {"include_orders": True, "filter_by": {
+        "source": "B2B", "platform": "Whatsapp",
+        "store_id": [], "branch_id": [], "status": "All",
+        "date_range": [from_date, today],
+        "search_on": ["order_number"], "search_text": "",
+        "exact_match": False,
+        "pagination": {"page_no": 1, "no_of_recs": 200, "sort_by": "order_cts", "order_by": False},
+        "whatsapp_contact_id": [], "review_required": False,
+    }}})
+    if not result: return 0
+    orders = result.get("result", {}).get("data", [])
+    if orders:
+        db_upsert_orders(orders)
+    return len(orders)
 
 # ─── Intent Detection ─────────────────────────────────────────────────────────
-
-INTENTS = {
-    "NEW_ORDER": {
-        "keywords": ["order", "i want", "i need", "can i get", "please send", "buy", "purchase",
-                     "add to order", "place order", "new order", "want to order", "like to order"],
-        "emoji": "🛒",
-        "label": "New Order",
-    },
-    "AMEND_ORDER": {
-        "keywords": ["change", "amend", "modify", "update", "edit", "instead", "replace",
-                     "add more", "reduce", "increase", "decrease", "adjust", "correction"],
-        "emoji": "✏️",
-        "label": "Amend Order",
-    },
-    "CANCEL_ORDER": {
-        "keywords": ["cancel", "cancellation", "don't want", "dont want", "remove", "delete order",
-                     "stop order", "no longer need", "nevermind", "never mind", "call off"],
-        "emoji": "❌",
-        "label": "Cancel Order",
-    },
-    "ENQUIRY": {
-        "keywords": ["price", "how much", "available", "availability", "stock", "when", "delivery",
-                     "what is", "do you have", "tell me", "info", "information", "details", "?"],
-        "emoji": "💬",
-        "label": "Enquiry",
-    },
-    "ORDER_STATUS": {
-        "keywords": ["status", "where is", "my order", "tracking", "delivered", "when will",
-                     "update on", "check order", "order number"],
-        "emoji": "📦",
-        "label": "Order Status",
-    },
-    "GREETING": {
-        "keywords": ["hi", "hello", "hey", "good morning", "good afternoon", "good evening",
-                     "morning", "afternoon", "evening", "howdy", "sup"],
-        "emoji": "👋",
-        "label": "Greeting",
-    },
+INTENT_KEYWORDS = {
+    "NEW_ORDER":    ["order","i want","i need","can i get","can i order","please send","like to order","want to order","purchase"],
+    "AMEND_ORDER":  ["change","amend","modify","update","instead","replace","add more","reduce","increase","decrease"],
+    "CANCEL_ORDER": ["cancel","don't want","dont want","stop order","remove order","no longer need","nevermind"],
+    "ORDER_STATUS": ["status","where is my order","my order","tracking","when will","check order","delivered yet"],
+    "ENQUIRY":      ["price","how much","available","stock","do you have","what is","info","details"],
+    "GREETING":     ["hi","hello","hey","good morning","good afternoon","good evening","morning","afternoon"],
 }
 
-def detect_intent_rules(text: str) -> Tuple[str, float]:
-    """Rule-based intent detection. Returns (intent, confidence 0-1)."""
-    text_lower = text.lower()
-    scores = {}
-    for intent, config in INTENTS.items():
-        matches = sum(1 for kw in config["keywords"] if kw in text_lower)
-        if matches > 0:
-            scores[intent] = matches / len(config["keywords"])
-
-    if not scores:
-        return "UNKNOWN", 0.0
-
+def detect_intent(text: str) -> Tuple[str, float]:
+    t = text.lower()
+    scores: Dict[str, int] = {}
+    for intent, kws in INTENT_KEYWORDS.items():
+        hits = sum(1 for kw in kws if kw in t)
+        if hits: scores[intent] = hits
+    if not scores: return "UNKNOWN", 0.3
     best = max(scores, key=scores.get)
-    # Normalize confidence
-    confidence = min(scores[best] * 10, 1.0)
-    return best, confidence
+    return best, min(scores[best] / 3.0, 1.0)
 
-def extract_order_items(text: str) -> List[Dict]:
-    """
-    Extract product names and quantities from natural language.
-    e.g. "I want 3 boxes of chicken karaage and 10 pcs mushroom"
-    → [{"name": "chicken karaage", "qty": 3, "uom": "boxes"}, ...]
-    """
+def extract_items(text: str) -> List[Dict]:
     items = []
-    # Pattern: number + optional unit + product name
-    patterns = [
-        r'(\d+)\s*(boxes?|pcs?|packets?|pkts?|kgs?|units?|packs?|cartons?|bags?|bottles?|cans?)?\s+(?:of\s+)?([a-zA-Z][a-zA-Z\s\-]{2,40}?)(?:\s+and|\s*,|\s*$)',
-        r'([a-zA-Z][a-zA-Z\s\-]{2,40}?)\s*[x×]\s*(\d+)',
-    ]
-
-    for pattern in patterns:
-        for match in re.finditer(pattern, text, re.IGNORECASE):
-            groups = match.groups()
-            if len(groups) == 3:
-                qty, uom, name = groups
-                items.append({"name": name.strip(), "qty": int(qty), "uom": uom or "unit"})
-            elif len(groups) == 2:
-                name, qty = groups
-                items.append({"name": name.strip(), "qty": int(qty), "uom": "unit"})
-
+    pattern = r'(\d+)\s*(boxes?|pcs?|packets?|pkts?|kgs?|units?|bags?|cans?|bottles?)?\s+(?:of\s+)?([a-zA-Z][a-zA-Z\s]{2,30}?)(?=\s+and\b|\s*,|\s*$)'
+    for m in re.finditer(pattern, text, re.IGNORECASE):
+        qty, uom, name = m.groups()
+        name = name.strip().rstrip('.,')
+        if name: items.append({"name": name, "qty": int(qty), "uom": uom or "unit"})
     return items
 
 def extract_order_number(text: str) -> Optional[str]:
-    """Extract order number like B2B-22082025-003 from text."""
-    pattern = r'[A-Z]{2,5}[-/]\d{6,12}[-/]\d{1,5}'
-    match = re.search(pattern, text.upper())
-    return match.group(0) if match else None
+    m = re.search(r'[A-Z]{2,5}[-/]\d{6,12}[-/]\d{1,5}', text.upper())
+    return m.group(0) if m else None
 
-# ─── Claude AI Intent Analysis ────────────────────────────────────────────────
+# ─── AI Analysis ──────────────────────────────────────────────────────────────
+async def analyze_with_ai(text: str, sender: str, customer: Optional[str], history: List[Dict]) -> Dict:
+    anthropic_key = credentials["agent"].get("anthropic_key","")
+    openai_key    = credentials["agent"].get("openai_key","")
+    intent, confidence = detect_intent(text)
+    base = {"intent": intent, "confidence": confidence, "items": extract_items(text),
+            "order_number": extract_order_number(text), "reply": None, "method": "rule-based"}
+    if not anthropic_key and not openai_key: return base
 
-async def analyze_with_ai(
-    message_text: str,
-    sender_name: str,
-    customer_name: Optional[str],
-    recent_context: List[Dict],
-) -> Dict:
-    """
-    Use AI (Claude or OpenAI) to understand message intent.
-    Falls back to rule-based if no API key is set.
-    Priority: Anthropic > OpenAI > rule-based
-    """
-    anthropic_key = credentials["agent"].get("anthropic_key", "")
-    openai_key    = credentials["agent"].get("openai_key", "")
-
-    # Rule-based fallback function
-    def rule_based():
-        intent, confidence = detect_intent_rules(message_text)
-        return {
-            "intent": intent,
-            "confidence": confidence,
-            "items": extract_order_items(message_text),
-            "order_number": extract_order_number(message_text),
-            "summary": f"Detected {intent} with {confidence:.0%} confidence",
-            "suggested_reply": None,
-            "method": "rule-based",
-        }
-
-    if not anthropic_key and not openai_key:
-        return rule_based()
-
-    # Build shared prompt content
-    context_str = ""
-    if recent_context:
-        context_str = "\n".join([f"{m['role'].upper()}: {m['text']}" for m in recent_context[-4:]])
-
-    system_prompt = """You are an AI agent for a B2B food distribution company using WhatsApp for orders.
-Analyze incoming WhatsApp messages and extract structured intent and order data.
-Always respond with valid JSON only — no markdown, no explanation.
-
-Intent types:
-- NEW_ORDER: Customer wants to place a new order
-- AMEND_ORDER: Customer wants to change an existing order
-- CANCEL_ORDER: Customer wants to cancel an order
-- ORDER_STATUS: Customer asking about order status/tracking
-- ENQUIRY: Product/price/availability question
-- GREETING: Just saying hello
-- UNKNOWN: Cannot determine intent
-
-JSON response format:
+    ctx = "\n".join([f"{m['role'].upper()}: {m['text']}" for m in history[-4:]]) if history else "None"
+    system = """You are a WhatsApp ordering assistant for a B2B food distribution company.
+Return ONLY valid JSON — no markdown.
+Intent: NEW_ORDER, AMEND_ORDER, CANCEL_ORDER, ORDER_STATUS, ENQUIRY, GREETING, UNKNOWN
 {
-  "intent": "NEW_ORDER",
-  "confidence": 0.95,
-  "items": [{"name": "product name", "qty": 5, "uom": "boxes"}],
+  "intent": "NEW_ORDER", "confidence": 0.95,
+  "items": [{"name": "chicken", "qty": 5, "uom": "unit"}],
   "order_number": null,
-  "summary": "one sentence summary",
-  "suggested_reply": "friendly professional reply to send back",
-  "urgency": "normal"
+  "reply": "friendly reply confirming what you understood"
 }"""
+    user = f"Sender: {sender}\nCustomer: {customer or 'Unknown'}\nHistory:\n{ctx}\nMessage: \"{text}\""
 
-    user_prompt = f"""Analyze this WhatsApp message:
-
-Sender: {sender_name}
-Customer account: {customer_name or 'Unknown'}
-Recent conversation:
-{context_str}
-
-Latest message: "{message_text}"
-
-Extract the intent and order details. Write a friendly, professional suggested_reply."""
-
-    # ── Try Anthropic Claude ──
     if anthropic_key:
         try:
-            async with httpx.AsyncClient(timeout=20) as client:
-                resp = await client.post(
-                    "https://api.anthropic.com/v1/messages",
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.post("https://api.anthropic.com/v1/messages",
                     headers={"x-api-key": anthropic_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                    json={"model": "claude-haiku-4-5-20251001", "max_tokens": 600,
-                          "system": system_prompt, "messages": [{"role": "user", "content": user_prompt}]},
-                )
-                data = resp.json()
-                text = data["content"][0]["text"].strip()
-                text = re.sub(r'^```json\s*|\s*```$', '', text.strip())
-                result = json.loads(text)
-                result["method"] = "claude-ai"
+                    json={"model": "claude-haiku-4-5-20251001", "max_tokens": 400, "system": system,
+                          "messages": [{"role": "user", "content": user}]})
+                raw = re.sub(r'^```json\s*|\s*```$', '', r.json()["content"][0]["text"].strip())
+                result = json.loads(raw)
+                result["method"] = "claude"
                 return result
         except Exception as e:
-            logger.error(f"Claude API error: {e} — trying OpenAI fallback")
+            logger.error("Claude error: %s", e)
 
-    # ── Try OpenAI ──
     if openai_key:
         try:
-            async with httpx.AsyncClient(timeout=20) as client:
-                resp = await client.post(
-                    "https://api.openai.com/v1/chat/completions",
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.post("https://api.openai.com/v1/chat/completions",
                     headers={"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"},
-                    json={
-                        "model": "gpt-4o-mini",
-                        "max_tokens": 600,
-                        "temperature": 0.2,
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user",   "content": user_prompt},
-                        ],
-                        "response_format": {"type": "json_object"},
-                    },
-                )
-                data = resp.json()
-                text = data["choices"][0]["message"]["content"].strip()
-                result = json.loads(text)
-                result["method"] = "openai-gpt4o-mini"
+                    json={"model": "gpt-4o-mini", "max_tokens": 400, "temperature": 0.1,
+                          "response_format": {"type": "json_object"},
+                          "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]})
+                result = json.loads(r.json()["choices"][0]["message"]["content"])
+                result["method"] = "openai"
                 return result
         except Exception as e:
-            logger.error(f"OpenAI API error: {e} — falling back to rule-based")
+            logger.error("OpenAI error: %s", e)
+    return base
 
-    return rule_based()
-
-# ─── Intent Handlers ────────────────────────────────────────────────────────
-# ─── Intent Handlers ──────────────────────────────────────────────────────────
-
-async def lookup_products_for_items(items: List[Dict], relation_id: str = "") -> List[Dict]:
-    """Search SNC for each item by name and enrich with product IDs, price, UOM."""
+# ─── Order helpers ────────────────────────────────────────────────────────────
+async def lookup_products_for_items(items: List[Dict]) -> List[Dict]:
     enriched = []
     for item in items:
+        # First check local DB
+        db = get_db()
+        row = db.execute("SELECT * FROM products WHERE name LIKE ? OR sku LIKE ? LIMIT 1",
+                         (f"%{item['name']}%", f"%{item['name']}%")).fetchone()
+        db.close()
+        if row:
+            enriched.append({**item, "item_id": row["item_id"], "sku": row["sku"],
+                "full_name": row["name"], "uom": row["uom"], "uom_id": row["uom_id"],
+                "base_uom": row["uom"], "base_uom_id": row["uom_id"],
+                "price": row["price"], "tax_rate": row["tax_rate"],
+                "tax_code": row["tax_code"], "tax_code_id": row["tax_code_id"], "found": True})
+            continue
+        # Fall back to SNC API
         result = await snc_call("/products/list", {"data": {"filter_by": {
-            "search_text": [item["name"]],
-            "search_on": ["name", "sku", "product_code"],
+            "search_text": [item["name"]], "search_on": ["name","sku"],
             "confidence": 0.5, "exact_match": False,
-            "pagination": {"page_no": 1, "no_of_recs": 5, "sort_by": "cts", "order_by": False},
+            "pagination": {"page_no":1,"no_of_recs":5,"sort_by":"cts","order_by":False},
             "view": "individual", "status": "Active",
-            "include_columns": ["name", "sku", "prices", "uom", "uom_id", "item_id", "tax_code", "tax_code_id", "tax_rate"],
+            "include_columns": ["name","sku","prices","uom","uom_id","item_id","tax_code","tax_code_id","tax_rate"],
             "merged": True, "bundles": False,
-            **({"relation_id": relation_id} if relation_id else {}),
         }}})
-        if result and result.get("result", {}).get("data"):
-            product = result["result"]["data"][0]
-            prices  = product.get("prices", [])
-            price   = prices[0].get("price", 0) if prices else 0
-            enriched.append({
-                **item,
-                "item_id":      product.get("item_id", ""),
-                "sku":          product.get("sku", ""),
-                "full_name":    product.get("name", item["name"]),
-                "uom":          product.get("uom", item.get("uom", "unit")),
-                "uom_id":       product.get("uom_id", ""),
-                "base_uom":     product.get("uom", item.get("uom", "unit")),
-                "base_uom_id":  product.get("uom_id", ""),
-                "price":        price,
-                "tax_rate":     product.get("tax_rate", 9),
-                "tax_code":     product.get("tax_code", "SR9"),
-                "tax_code_id":  product.get("tax_code_id", ""),
-                "found":        True,
-            })
+        if result and result.get("result",{}).get("data"):
+            p = result["result"]["data"][0]
+            prices = p.get("prices",[])
+            price  = prices[0].get("price",0) if prices else 0
+            enriched.append({**item, "item_id": p.get("item_id",""), "sku": p.get("sku",""),
+                "full_name": p.get("name",item["name"]), "uom": p.get("uom",item.get("uom","unit")),
+                "uom_id": p.get("uom_id",""), "base_uom": p.get("uom","unit"),
+                "base_uom_id": p.get("uom_id",""), "price": price,
+                "tax_rate": p.get("tax_rate",9), "tax_code": p.get("tax_code","SR9"),
+                "tax_code_id": p.get("tax_code_id",""), "found": True})
         else:
             enriched.append({**item, "found": False})
     return enriched
 
+async def push_order_to_snc(items: List[Dict], chat_id: str, delivery_date: str, sender_name: str) -> Optional[str]:
+    assignment = db_get_assignment(chat_id) or {}
+    store_id   = assignment.get("store_id","")
+    store      = assignment.get("customer","")
+    branch_id  = assignment.get("branch_id","")
+    branch_name= assignment.get("branch","Main Branch")
+    username   = credentials["snc"].get("username","")
+    user_id    = credentials["snc"].get("user_id","")
+    company_id = credentials["snc"].get("company_id","mindmasters")
+    delivery   = delivery_date or (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
 
-async def get_customer_info(chat_id: str) -> Optional[Dict]:
-    """Look up customer by WhatsApp chat_id."""
-    result = await snc_call("/whatsapp/contacts/get", {"data": {"filter_by": {
-        "phone_number": chat_id.replace("@s.whatsapp.net", "").replace("@g.us", ""),
-        "search_text":  "",
-        "exact_match":  False,
-    }}})
-    if result and result.get("result"):
-        r = result["result"]
-        if isinstance(r, list) and r:
-            return r[0]
-        if isinstance(r, dict):
-            return r
-    return None
-
-
-async def push_order_to_snc(
-    items: List[Dict],
-    customer_info: Dict,
-    delivery_date: str,
-    chat_id: str,
-    sender_name: str,
-) -> Optional[str]:
-    """
-    Create order in SNC. Returns order_number on success, None on failure.
-    Uses the exact payload format from Postman collection.
-    """
-    today = datetime.now().strftime("%Y-%m-%d")
-    delivery = delivery_date or (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-
-    # Build item_info list
-    item_info = []
+    item_info  = []
     item_total = 0.0
     tax_total  = 0.0
-
     for it in items:
-        if not it.get("found") or not it.get("item_id"):
-            continue
-        qty        = it.get("qty", 1)
-        price      = it.get("price", 0)
-        tax_rate   = it.get("tax_rate", 9)
+        if not it.get("found") or not it.get("item_id"): continue
+        qty        = it.get("qty",1)
+        price      = it.get("price",0)
+        tax_rate   = it.get("tax_rate",9)
         line_total = round(qty * price, 5)
         tax_amt    = round(line_total * tax_rate / 100, 5)
-        item_total += line_total
-        tax_total  += tax_amt
-
+        item_total += line_total; tax_total += tax_amt
         item_info.append({
-            "item_id":              it["item_id"],
-            "name":                 it["full_name"],
-            "sku":                  it["sku"],
-            "tax_code":             it["tax_code"],
-            "tax_code_id":          it["tax_code_id"],
-            "tax_rate":             tax_rate,
-            "tax_amount":           tax_amt,
-            "uom":                  it["uom"],
-            "uom_id":               it["uom_id"],
-            "base_uom_id":          it["base_uom_id"],
-            "base_uom":             it["base_uom"],
-            "conversion_rate":      1,
-            "qty":                  qty,
-            "new_qty":              qty,
-            "actual_qty":           qty,
-            "total_order_qty":      0,
-            "price":                price,
-            "special_price_enabled":False,
-            "promotion_enabled":    False,
-            "promotion_info":       {"promotion_id":None,"name":None,"discount_type":None,"discount_value":None,"promotional_stock":None,"purchase_limit":None,"discount_amount":None},
-            "discount_info":        {"discount_type":"% Discount","discount_id":None,"discount_name":None,"deal_id":None,"deal_name":None,"discount":0,"discount_amount":0,"coupon_code":0},
-            "item_total":           line_total,
-            "adjusted_qty":         0, "available_qty": 0, "free": 0,
-            "is_offer_item":        False, "actual_is_offer_item": False,
-            "movement_info":        [], "new_movement_info":       [],
-            "exchange":             False, "damaged": False, "deleted": False,
-            "auto_assign":          False, "picked": False, "packed": False,
-            "packed_qty":           0, "picked_qty": 0,
-            "has_catch_weight":     False, "cw_conversion": 1,
-            "cw_price":             price, "cw_qty": qty,
-            "actual_sku":           it["sku"],
-            "actual_name":          it["full_name"],
-            "actual_uom":           it["uom"],
-            "actual_uom_id":        it["uom_id"],
-            "actual_base_uom_id":   it["base_uom_id"],
-            "actual_base_uom":      it["base_uom"],
-            "actual_conversion_rate":1,
-            "actual_qty_for_return":qty,
-            "actual_price":         price,
-            "drop_shipping":        False,
-            "drop_shipping_from_product":"No Drop Ship",
-            "tags":                 [],
+            "item_id": it["item_id"], "name": it["full_name"], "sku": it["sku"],
+            "tax_code": it["tax_code"], "tax_code_id": it["tax_code_id"],
+            "tax_rate": tax_rate, "tax_amount": tax_amt,
+            "uom": it["uom"], "uom_id": it["uom_id"],
+            "base_uom_id": it["base_uom_id"], "base_uom": it["base_uom"],
+            "conversion_rate": 1, "qty": qty, "new_qty": qty, "actual_qty": qty,
+            "total_order_qty": 0, "price": price,
+            "special_price_enabled": False, "promotion_enabled": False,
+            "promotion_info": {"promotion_id":None,"name":None,"discount_type":None,"discount_value":None,"promotional_stock":None,"purchase_limit":None,"discount_amount":None},
+            "discount_info": {"discount_type":"% Discount","discount_id":None,"discount_name":None,"deal_id":None,"deal_name":None,"discount":0,"discount_amount":0,"coupon_code":0},
+            "item_total": line_total, "adjusted_qty": 0, "available_qty": 0, "free": 0,
+            "is_offer_item": False, "actual_is_offer_item": False,
+            "movement_info": [], "new_movement_info": [],
+            "exchange": False, "damaged": False, "deleted": False,
+            "auto_assign": False, "picked": False, "packed": False,
+            "packed_qty": 0, "picked_qty": 0, "has_catch_weight": False,
+            "cw_conversion": 1, "cw_price": price, "cw_qty": qty,
+            "actual_sku": it["sku"], "actual_name": it["full_name"],
+            "actual_uom": it["uom"], "actual_uom_id": it["uom_id"],
+            "actual_base_uom_id": it["base_uom_id"], "actual_base_uom": it["base_uom"],
+            "actual_conversion_rate": 1, "actual_qty_for_return": qty,
+            "actual_price": price, "drop_shipping": False,
+            "drop_shipping_from_product": "No Drop Ship", "tags": [],
         })
+    if not item_info: return None
 
-    if not item_info:
-        return None
-
-    total_amount = round(item_total + tax_total, 5)
-    username     = credentials["snc"].get("username", "")
-    user_id      = credentials["snc"].get("user_id", "")
-    company_id   = credentials["snc"].get("company_id", "mindmasters")
-
-    # First check chat_assignments (set via UI), then fall back to customer_info from SNC
-    assigned   = chat_assignments.get(chat_id, {})
-    store_id   = assigned.get("store_id")   or (customer_info.get("store_id", "")   if customer_info else "")
-    store      = assigned.get("customer")   or (customer_info.get("store", "")      if customer_info else "")
-    branch_id  = assigned.get("branch_id")  or (customer_info.get("branch_id", "")  if customer_info else "")
-    branch_name= assigned.get("branch")     or (customer_info.get("branch_name", "Main Branch") if customer_info else "Main Branch")
-    del_addr_id= customer_info.get("delivery_address_id", "") if customer_info else ""
-    del_addr   = customer_info.get("delivery_address_info", {}) if customer_info else {}
-    bill_addr_id=customer_info.get("billing_address_id", "") if customer_info else ""
-    bill_addr  = customer_info.get("billing_address_info", {}) if customer_info else {}
-
-    order_data = {
-        "company_id":    company_id,
-        "source":        "B2B",
-        "platform":      "Whatsapp",
-        "store_id":      store_id,
-        "store":         store,
-        "branch_id":     branch_id,
-        "branch_name":   branch_name,
-        "currency":      "SGD",
-        "items_count":   len(item_info),
-        "order_status":  "Pending",
-        "paid_status":   "Pending",
-        "delivery_type": "Delivery",
-        "delivery_date": delivery,
-        "item_total":    item_total,
-        "tax_amount":    tax_total,
-        "total_amount":  total_amount,
-        "created_by":    username,
-        "updated_by":    username,
-        "created_by_id": user_id,
-        "user_id":       user_id,
-        "user_name":     username,
-        "item_info":     item_info,
+    result = await snc_call("/b2b/order/save", {"data": {
+        "company_id": company_id, "source": "B2B", "platform": "Whatsapp",
+        "store_id": store_id, "store": store,
+        "branch_id": branch_id, "branch_name": branch_name,
+        "currency": "SGD", "items_count": len(item_info),
+        "order_status": "Pending", "paid_status": "Pending",
+        "delivery_type": "Delivery", "delivery_date": delivery,
+        "item_total": item_total, "tax_amount": tax_total,
+        "total_amount": round(item_total + tax_total, 5),
+        "created_by": username, "updated_by": username,
+        "created_by_id": user_id, "user_id": user_id, "user_name": username,
+        "item_info": item_info,
         "discount_info": {"discount_type":"% Discount","discount":0,"discount_amount":0,"discount_id":None,"discount_name":None,"deal_id":None,"deal_name":None,"coupon_code":None},
         "coupon_info":   {"discount_type":"% Discount","discount":0,"discount_amount":0,"discount_id":None,"discount_name":None,"deal_id":None,"deal_name":None,"coupon_code":None},
-        "free_shipping": False,
-        "payment_info":  [],
-        "applied_credit_notes": [],
-        "advance_amount":0,
-        "delivery_address_id":   del_addr_id,
-        "delivery_address_info": del_addr,
-        "billing_address_id":    bill_addr_id,
-        "billing_address_info":  bill_addr,
-        "delivery_charges":      0,
-        "tax_inclusive":         False,
-        "installation_info":     {"installation":False,"installation_date":None,"installation_charges":0},
-        "whatsapp_contact_id":   chat_id,
-    }
-
-    result = await snc_call("/b2b/order/save", {"data": order_data})
+        "free_shipping": False, "payment_info": [], "applied_credit_notes": [],
+        "advance_amount": 0, "delivery_charges": 0, "tax_inclusive": False,
+        "installation_info": {"installation":False,"installation_date":None,"installation_charges":0},
+        "whatsapp_contact_id": chat_id,
+    }})
     if result:
-        order_num = result.get("result", {}).get("order_number") or result.get("order_number")
-        logger.info(f"Order created: {order_num}")
+        order_num = result.get("result",{}).get("order_number") or result.get("order_number")
+        logger.info("Order created: %s", order_num)
         return order_num
     return None
 
-
-async def handle_new_order(analysis: Dict, sender_name: str, chat_id: str) -> str:
-    items     = analysis.get("items", [])
-    confirmed = analysis.get("confirmed", False)
-
-    if not items:
-        return (
-            f"Hi {sender_name}! 🛒 I'd like to help you place an order.\n\n"
-            f"Please tell me:\n• *Product name*\n• *Quantity & unit* (e.g. 5 boxes)\n• *Delivery date*\n\n"
-            f"Example: _5 boxes chicken karaage, delivery tomorrow_"
-        )
-
-    # Step 1: Look up products in SNC
-    enriched = await lookup_products_for_items(items)
-    found    = [i for i in enriched if i.get("found")]
-    missing  = [i for i in enriched if not i.get("found")]
-
-    if not found:
-        item_names = ", ".join([i["name"] for i in items])
-        return (
-            f"I couldn't find these products in our catalogue: *{item_names}*\n\n"
-            f"Please check the product names and try again, or type *products* to browse."
-        )
-
-    # Step 2: Show confirmation with found products + prices
-    lines = []
-    for i in found:
-        price_str = f" @ ${i['price']:.2f}/{i['uom']}" if i.get("price") else ""
-        lines.append(f"  • *{i['full_name']}* × {i['qty']} {i['uom']}{price_str}")
-
-    total = sum(i.get("price", 0) * i.get("qty", 1) for i in found)
-
-    msg = f"Got it {sender_name}! 🛒 Here's your order summary:\n\n"
-    msg += "\n".join(lines)
-    if missing:
-        msg += f"\n\n⚠️ Not found: {', '.join([i['name'] for i in missing])}"
-    if total > 0:
-        msg += f"\n\n💰 Estimated total: *${total:.2f}* (excl. tax)"
-    msg += f"\n\n📅 Delivery date: *{analysis.get('delivery_date', 'tomorrow')}*"
-    msg += f"\n\n✅ Reply *CONFIRM* to place this order\n❌ Reply *CANCEL* to abort"
-
-    # Store pending order in conversation memory
-    conversation_memory[chat_id] = conversation_memory.get(chat_id, [])
-    conversation_memory[chat_id].append({
-        "role": "agent",
-        "text": msg,
-        "pending_order": {
-            "items": enriched,
-            "delivery_date": analysis.get("delivery_date", ""),
-        }
-    })
-
-    return msg
-
-
-async def handle_amend_order(analysis: Dict, sender_name: str, chat_id: str) -> str:
-    if analysis.get("suggested_reply"):
-        return analysis["suggested_reply"]
-    order_num = analysis.get("order_number")
-    items = analysis.get("items", [])
-    msg = f"Got it {sender_name}! ✏️ Let me confirm the amendment:\n\n"
-    if order_num:
-        msg += f"📋 Order: *{order_num}*\n"
-    if items:
-        msg += "Changes requested:\n"
-        for i in items:
-            msg += f"  • {i['name']} → {i['qty']} {i['uom']}\n"
-    msg += "\n✅ Reply *CONFIRM* to apply these changes, or let me know if I misunderstood."
-    return msg
-
-async def handle_cancel_order(analysis: Dict, sender_name: str, chat_id: str) -> str:
-    if analysis.get("suggested_reply"):
-        return analysis["suggested_reply"]
-    order_num = analysis.get("order_number")
-    if order_num:
-        return (
-            f"I understand you'd like to cancel order *{order_num}*, {sender_name}. ❌\n\n"
-            f"To confirm cancellation, please reply *CANCEL {order_num}*.\n\n"
-            f"⚠️ Note: Orders that are already packed or dispatched may not be cancellable."
-        )
-    return (
-        f"I understand you'd like to cancel an order, {sender_name}. ❌\n\n"
-        f"Could you please provide your *order number*? (e.g. B2B-22082025-001)\n"
-        f"You can find it in your order confirmation message."
-    )
-
-async def handle_order_status(analysis: Dict, sender_name: str, chat_id: str) -> str:
-    if analysis.get("suggested_reply"):
-        return analysis["suggested_reply"]
+# ─── Agent message handler ────────────────────────────────────────────────────
+def build_reply(analysis: Dict, sender: str) -> str:
+    if analysis.get("reply"): return analysis["reply"]
+    intent = analysis.get("intent","UNKNOWN")
+    items  = analysis.get("items",[])
     order_num = analysis.get("order_number")
 
-    if order_num:
-        # Try to fetch from SNC
-        today = datetime.now().strftime("%d-%m-%Y")
-        thirty_ago = (datetime.now() - timedelta(days=30)).strftime("%d-%m-%Y")
-        result = await snc_call("/b2b/orders/get", {"data": {"include_orders": True, "filter_by": {
-            "source": "B2B", "platform": "Whatsapp", "store_id": [], "branch_id": [],
-            "status": "All", "date_range": [thirty_ago, today],
-            "search_on": ["order_number"], "search_text": order_num,
-            "exact_match": True, "pagination": {"page_no": 1, "no_of_recs": 5, "sort_by": "order_cts", "order_by": False},
-            "whatsapp_contact_id": [],
-        }}})
-        if result and result.get("result", {}).get("data"):
-            orders = result["result"]["data"]
-            o = orders[0]
-            status = o.get("order_status", "Unknown")
-            total = o.get("total_amount", 0)
-            delivery = o.get("delivery_date", "TBD")
-            return (
-                f"📦 Order *{order_num}* status:\n\n"
-                f"• Status: *{status}*\n"
-                f"• Total: ${total:.2f}\n"
-                f"• Delivery Date: {delivery}\n\n"
-                f"Contact your sales rep if you need further assistance."
-            )
+    if intent == "NEW_ORDER":
+        if items:
+            lines = "\n".join([f"  • *{i['name']}* × {i['qty']} {i['uom']}" for i in items])
+            return f"Got it {sender}! 🛒\n\n{lines}\n\n✅ Reply *CONFIRM* to place order\n📅 Delivery date?"
+        return f"Hi {sender}! 🛒 What would you like to order?\n\nExample: _5 boxes chicken karaage, delivery tomorrow_"
+    elif intent == "AMEND_ORDER":
+        msg = f"Sure {sender}! ✏️ "
+        if order_num: msg += f"Order *{order_num}* — "
+        if items: msg += "\n".join([f"{i['name']} → {i['qty']} {i['uom']}" for i in items])
+        return msg + "\n\n✅ Reply *CONFIRM* to apply changes"
+    elif intent == "CANCEL_ORDER":
+        if order_num: return f"Cancel *{order_num}*? ❌\n\nReply *CANCEL {order_num}* to confirm."
+        return f"Please share your *order number* to cancel."
+    elif intent == "ORDER_STATUS":
+        return f"Checking your order status, {sender}... 📦\n\nPlease share your order number if you have it."
+    elif intent == "ENQUIRY":
+        return f"Thanks for your enquiry {sender}! 💬\n\nContact your sales rep for pricing & availability."
+    elif intent == "GREETING":
+        return (f"Hi {sender}! 👋\n\nHow can I help?\n"
+                "🛒 New order\n✏️ Amend order\n❌ Cancel order\n📦 Order status\n💬 Enquiry")
+    return f"Thanks {sender}! How can I help you today? 🙏"
 
-    # Fetch recent orders for this chat
-    today = datetime.now().strftime("%d-%m-%Y")
-    thirty_ago = (datetime.now() - timedelta(days=30)).strftime("%d-%m-%Y")
-    result = await snc_call("/b2b/orders/get", {"data": {"include_orders": True, "filter_by": {
-        "source": "B2B", "platform": "Whatsapp", "store_id": [], "branch_id": [],
-        "status": "All", "date_range": [thirty_ago, today],
-        "search_on": ["order_number"], "search_text": "",
-        "exact_match": False, "pagination": {"page_no": 1, "no_of_recs": 5, "sort_by": "order_cts", "order_by": False},
-        "whatsapp_contact_id": [chat_id],
-    }}})
-    if result and result.get("result", {}).get("data"):
-        lines = [f"📦 Your recent orders, {sender_name}:\n"]
-        for o in result["result"]["data"][:5]:
-            lines.append(f"• *{o.get('order_number','—')}* | {o.get('order_status','?')} | ${o.get('total_amount',0):.2f} | {o.get('delivery_date','')}")
-        return "\n".join(lines)
-
-    return (
-        f"I couldn't find recent orders for your account, {sender_name}. 📦\n\n"
-        f"Please share your *order number* (e.g. B2B-22082025-001) and I'll look it up!"
-    )
-
-async def handle_enquiry(analysis: Dict, sender_name: str, chat_id: str) -> str:
-    if analysis.get("suggested_reply"):
-        return analysis["suggested_reply"]
-    return (
-        f"Thanks for your enquiry, {sender_name}! 💬\n\n"
-        f"I'm checking on that for you. For immediate assistance:\n"
-        f"• Type *products* to browse our catalogue\n"
-        f"• Contact your sales rep for pricing & availability\n\n"
-        f"Is there anything specific you'd like to know?"
-    )
-
-async def handle_greeting(analysis: Dict, sender_name: str, customer_name: Optional[str]) -> str:
-    if analysis.get("suggested_reply"):
-        return analysis["suggested_reply"]
-    msg = f"Hi {sender_name}! 👋 Welcome to oneaether ordering."
-    if customer_name:
-        msg += f" Great to hear from *{customer_name}*!"
-    msg += (
-        "\n\nHow can I help you today?\n"
-        "🛒 *New order* — place an order\n"
-        "✏️ *Amend order* — change an existing order\n"
-        "❌ *Cancel order* — cancel an order\n"
-        "📦 *Order status* — check your order\n"
-        "💬 *Enquiry* — product or price info\n\n"
-        "_Just type naturally — I'll understand!_"
-    )
-    return msg
-
-# ─── Main AI Agent ────────────────────────────────────────────────────────────
-
-async def process_incoming_message(
-    message: Dict,
-    contact: Dict,
-    company_id: str,
-    chat_id: str,
-) -> str:
-    """
-    Main AI agent entry point.
-    Detects intent → routes to appropriate handler → returns reply.
-    """
-    # Skip if agent disabled
-    if not credentials["agent"]["enabled"]:
-        return None  # type: ignore
-
+async def process_incoming_message(message: Dict, contact: Dict, company_id: str, chat_id: str):
+    if not credentials["agent"]["enabled"]: return
     text = ""
     if message.get("type") == "text":
-        text = message.get("text", {}).get("body", "").strip()
-    elif message.get("type") in ("image", "document"):
-        text = message.get(message["type"], {}).get("caption", "") or f"[{message['type']} received]"
-    elif message.get("type") in ("audio", "voice"):
-        text = "[Voice message received - please type your order for processing]"
+        text = (message.get("text") or {}).get("body","").strip()
+    elif message.get("type") in ("image","document"):
+        text = (message.get(message["type"]) or {}).get("caption","") or f"[{message['type']} received]"
+    if not text: return
 
-    if not text:
-        return None  # type: ignore
+    sender = message.get("from_name") or contact.get("name") or "there"
+    db = get_db()
+    customer_row = db.execute("SELECT customer_name FROM customers WHERE phone LIKE ?",
+                              (f"%{chat_id.replace('@s.whatsapp.net','').replace('@g.us','')}%",)).fetchone()
+    db.close()
+    customer = customer_row["customer_name"] if customer_row else None
+    history  = conversation_memory.get(chat_id, [])
 
-    sender_name  = message.get("from_name") or contact.get("name") or "there"
-    snc_customers = contact.get("customers", [])
-    customer_name = snc_customers[0]["customer_name"] if snc_customers else None
-
-    # Get conversation context
-    context = conversation_memory.get(chat_id, [])
-
-    # Analyze intent
-    logger.info(f"[AGENT] Analyzing: '{text[:80]}' from {sender_name}")
-    analysis = await analyze_with_ai(text, sender_name, customer_name, context)
-    intent = analysis.get("intent", "UNKNOWN")
-    confidence = analysis.get("confidence", 0)
-    logger.info(f"[AGENT] Intent: {intent} ({confidence:.0%}) via {analysis.get('method','?')}")
-
-    # Store in conversation memory (keep last 6 turns)
-    context.append({"role": "customer", "text": text})
-    conversation_memory[chat_id] = context[-6:]
-
-    # Route to handler
-    intent_config = INTENTS.get(intent, {})
-    emoji = intent_config.get("emoji", "💬")
-    label = intent_config.get("label", intent)
-
-    # ── Handle CONFIRM / YES — execute pending order ──
-    if text.strip().upper() in ("CONFIRM", "YES", "YEP", "OK", "CONFIRMED"):
-        mem = conversation_memory.get(chat_id, [])
+    # Handle CONFIRM
+    if text.strip().upper() in ("CONFIRM","YES","YEP","OK","CONFIRMED"):
+        mem     = conversation_memory.get(chat_id,[])
         pending = next((m.get("pending_order") for m in reversed(mem) if m.get("pending_order")), None)
         if pending:
-            await whapi_send(chat_id, f"⏳ Placing your order now, {sender_name}...")
-            customer_info = await get_customer_info(chat_id)
+            await whapi_send(chat_id, f"⏳ Placing your order now...")
             order_num = await push_order_to_snc(
-                items=pending["items"],
-                customer_info=customer_info,
-                delivery_date=pending.get("delivery_date", ""),
-                chat_id=chat_id,
-                sender_name=sender_name,
-            )
+                items=pending["items"], chat_id=chat_id,
+                delivery_date=pending.get("delivery_date",""), sender_name=sender)
             if order_num:
-                reply = (
-                    f"✅ Order placed successfully, {sender_name}!\n\n"
-                    f"📋 Order Number: *{order_num}*\n"
-                    f"📅 Delivery: {pending.get('delivery_date', 'as requested')}\n\n"
-                    f"You'll receive a confirmation shortly. Type *orders* to track your order."
-                )
-                # Clear pending order
-                for m in mem:
-                    m.pop("pending_order", None)
+                reply = f"✅ Order placed! *{order_num}*\n📅 Delivery: {pending.get('delivery_date','as requested')}"
+                for m in mem: m.pop("pending_order",None)
             else:
-                reply = (
-                    f"⚠️ I couldn't create the order automatically, {sender_name}.\n\n"
-                    f"Please contact your sales rep to place this order manually.\n"
-                    f"Reference: {', '.join([i['full_name'] + ' x' + str(i['qty']) for i in pending['items'] if i.get('found')])}"
-                )
+                reply = f"⚠️ Could not create order automatically. Please contact your sales rep."
         else:
-            reply = f"No pending order found, {sender_name}. Please place a new order first."
+            reply = f"No pending order found. Please place a new order first."
+        await whapi_send(chat_id, reply)
+        db_log_message(chat_id, "agent", reply, "CONFIRM")
+        return
 
-    elif intent == "NEW_ORDER":
-        reply = await handle_new_order(analysis, sender_name, chat_id)
-    elif intent == "AMEND_ORDER":
-        reply = await handle_amend_order(analysis, sender_name, chat_id)
-    elif intent == "CANCEL_ORDER":
-        reply = await handle_cancel_order(analysis, sender_name, chat_id)
-    elif intent == "ORDER_STATUS":
-        reply = await handle_order_status(analysis, sender_name, chat_id)
-    elif intent == "ENQUIRY":
-        reply = await handle_enquiry(analysis, sender_name, chat_id)
-    elif intent == "GREETING":
-        reply = await handle_greeting(analysis, sender_name, customer_name)
+    analysis = await analyze_with_ai(text, sender, customer, history)
+    intent   = analysis.get("intent","UNKNOWN")
+    logger.info("[AGENT] %s | %s | %.0f%%", intent, sender, analysis.get("confidence",0)*100)
+
+    # For new orders, enrich with product lookup
+    if intent == "NEW_ORDER" and analysis.get("items"):
+        enriched = await lookup_products_for_items(analysis["items"])
+        found    = [i for i in enriched if i.get("found")]
+        missing  = [i for i in enriched if not i.get("found")]
+        if found:
+            lines = "\n".join([f"  • *{i['full_name']}* × {i['qty']} {i['uom']}" +
+                               (f" @ ${i['price']:.2f}" if i.get("price") else "") for i in found])
+            total = sum(i.get("price",0)*i.get("qty",1) for i in found)
+            reply = f"Got it {sender}! 🛒\n\n{lines}"
+            if missing: reply += f"\n\n⚠️ Not found: {', '.join(i['name'] for i in missing)}"
+            if total > 0: reply += f"\n\n💰 Est. total: *${total:.2f}* (excl. tax)"
+            reply += f"\n\n✅ Reply *CONFIRM* to place order\n📅 What delivery date?"
+            # Store pending order
+            conversation_memory.setdefault(chat_id,[]).append({"role":"agent","text":reply,
+                "pending_order":{"items":enriched,"delivery_date":""}})
+        else:
+            reply = f"I couldn't find those products. Please check names and try again."
     else:
-        reply = (
-            f"Thanks for your message, {sender_name}! 🙏\n\n"
-            "I'm your ordering assistant. You can:\n"
-            "🛒 Place a new order\n✏️ Amend an order\n❌ Cancel an order\n📦 Check order status\n💬 Make an enquiry\n\n"
-            "_Just type naturally and I'll understand!_"
-        )
+        reply = build_reply(analysis, sender)
 
-    # Store reply in context
-    conversation_memory[chat_id].append({"role": "agent", "text": reply})
-
-    # Log intent for analytics
-    logger.info(f"[AGENT] {emoji} {label} | {sender_name} | confidence={confidence:.0%} | method={analysis.get('method')}")
-
-    return reply
+    await whapi_send(chat_id, reply)
+    conversation_memory.setdefault(chat_id,[]).append({"role":"customer","text":text})
+    conversation_memory[chat_id].append({"role":"agent","text":reply})
+    conversation_memory[chat_id] = conversation_memory[chat_id][-10:]
+    db_log_message(chat_id, "customer", text, intent)
+    db_log_message(chat_id, "agent", reply)
 
 # ─── Routes ──────────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_frontend():
     html_file = Path(__file__).parent / "oneaether.html"
-    if html_file.exists():
-        return HTMLResponse(content=html_file.read_text())
-    return HTMLResponse(content="<h2 style='font-family:sans-serif;padding:40px'>✓ oneaether.ai backend running!</h2>")
-
-@app.get("/proxy/whapi/group/{chat_id}")
-async def proxy_whapi_group(chat_id: str):
-    """Fetch group info and participants from Whapi."""
-    base  = credentials["whapi"].get("base_url", "https://gate.whapi.cloud")
-    async with httpx.AsyncClient(timeout=15) as client:
-        try:
-            resp = await client.get(f"{base}/groups/{chat_id}", headers=whapi_headers())
-            return resp.json()
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=str(e))
-
-@app.post("/assignments")
-async def save_assignments(request: Request):
-    """Save chat→customer/branch assignments from the UI."""
-    body = await request.json()
-    new_assignments = body.get("assignments", {})
-    chat_assignments.update(new_assignments)
-    logger.info(f"Saved {len(new_assignments)} assignments")
-    return {"status": "ok", "total": len(chat_assignments)}
-
-@app.get("/assignments")
-async def get_assignments():
-    return {"assignments": chat_assignments}
+    if html_file.exists(): return HTMLResponse(content=html_file.read_text())
+    return HTMLResponse(content="<h2>✓ oneaether.ai running</h2>")
 
 @app.get("/health")
 async def health():
-    return {
-        "status": "ok",
-        "timestamp": datetime.utcnow().isoformat(),
-        "snc_configured":   bool(credentials["snc"].get("access_token")),
-        "whapi_configured": bool(credentials["whapi"].get("token")),
-        "agent_enabled":    credentials["agent"]["enabled"],
-        "ai_model": (
-            "claude-haiku" if credentials["agent"]["anthropic_key"]
-            else "gpt-4o-mini" if credentials["agent"]["openai_key"]
-            else "rule-based"
-        ),
+    db = get_db()
+    counts = {
+        "customers": db.execute("SELECT COUNT(*) FROM customers").fetchone()[0],
+        "products":  db.execute("SELECT COUNT(*) FROM products").fetchone()[0],
+        "orders":    db.execute("SELECT COUNT(*) FROM orders").fetchone()[0],
     }
-
-@app.get("/agent/status")
-async def agent_status():
-    return {
-        "enabled":       credentials["agent"]["enabled"],
-        "ai_powered":    bool(credentials["agent"]["anthropic_key"]),
-        "model": (
-            "claude-haiku-4-5" if credentials["agent"]["anthropic_key"]
-            else "gpt-4o-mini" if credentials["agent"]["openai_key"]
-            else "rule-based"
-        ),
-        "active_chats":  len(conversation_memory),
-        "intents":       list(INTENTS.keys()),
-    }
-
-@app.post("/agent/toggle")
-async def toggle_agent(request: Request):
-    body = await request.json()
-    credentials["agent"]["enabled"] = body.get("enabled", True)
-    status = "ENABLED" if credentials["agent"]["enabled"] else "DISABLED"
-    logger.info(f"AI Agent {status}")
-    return {"enabled": credentials["agent"]["enabled"], "status": status}
-
-@app.post("/agent/test")
-async def test_agent(request: Request):
-    """Test the AI agent with a sample message without sending WhatsApp reply."""
-    body = await request.json()
-    text = body.get("message", "I want to order 5 boxes of chicken karaage")
-    sender = body.get("sender", "Test User")
-
-    analysis = await analyze_with_ai(text, sender, None, [])
-    intent = analysis.get("intent", "UNKNOWN")
-
-    # Generate reply
-    fake_message = {"type": "text", "text": {"body": text}, "from_name": sender, "from": "test", "chat_id": "test"}
-    reply = await process_incoming_message(fake_message, {}, "test", "test_chat")
-
-    return {
-        "input": text,
-        "intent": intent,
-        "confidence": analysis.get("confidence"),
-        "items": analysis.get("items", []),
-        "order_number": analysis.get("order_number"),
-        "summary": analysis.get("summary"),
-        "method": analysis.get("method"),
-        "reply": reply,
-    }
+    db.close()
+    return {"status":"ok","timestamp":datetime.utcnow().isoformat(),
+            "snc_configured":bool(credentials["snc"].get("access_token")),
+            "whapi_configured":bool(credentials["whapi"].get("token")),
+            "agent_enabled":credentials["agent"]["enabled"],
+            "db_counts":counts}
 
 @app.post("/credentials")
 async def save_credentials(payload: CredentialsPayload):
     if payload.snc:
-        credentials["snc"].update({k: v for k, v in payload.snc.items() if v})
+        for k,v in payload.snc.items():
+            if v: credentials["snc"][k] = v
+        if payload.snc.get("api_url"):      db_set_credential("snc_api_url",    payload.snc["api_url"])
+        if payload.snc.get("access_token"): db_set_credential("snc_token",      payload.snc["access_token"])
+        if payload.snc.get("user_id"):      db_set_credential("snc_user_id",    payload.snc["user_id"])
+        if payload.snc.get("username"):     db_set_credential("snc_username",   payload.snc["username"])
+        if payload.snc.get("company_id"):   db_set_credential("snc_company_id", payload.snc["company_id"])
     if payload.whapi:
-        credentials["whapi"].update({k: v for k, v in payload.whapi.items() if v})
+        for k,v in payload.whapi.items():
+            if v: credentials["whapi"][k] = v
+        if payload.whapi.get("token"):      db_set_credential("whapi_token",      payload.whapi["token"])
+        if payload.whapi.get("base_url"):   db_set_credential("whapi_base_url",   payload.whapi["base_url"])
+        if payload.whapi.get("channel_id"): db_set_credential("whapi_channel_id", payload.whapi["channel_id"])
     if payload.agent:
-        if "enabled" in payload.agent:
-            credentials["agent"]["enabled"] = payload.agent["enabled"] == "true"
-        if "anthropic_key" in payload.agent and payload.agent["anthropic_key"]:
-            credentials["agent"]["anthropic_key"] = payload.agent["anthropic_key"]
-        if "openai_key" in payload.agent and payload.agent["openai_key"]:
-            credentials["agent"]["openai_key"] = payload.agent["openai_key"]
-    return {"status": "ok"}
+        if payload.agent.get("anthropic_key"): db_set_credential("anthropic_key", payload.agent["anthropic_key"])
+        if payload.agent.get("openai_key"):    db_set_credential("openai_key",    payload.agent["openai_key"])
+    return {"status":"ok"}
 
 @app.get("/credentials/status")
 async def credentials_status():
     return {
-        "snc":   {"api_url": credentials["snc"].get("api_url",""), "company_id": credentials["snc"].get("company_id",""), "authenticated": bool(credentials["snc"].get("access_token"))},
-        "whapi": {"base_url": credentials["whapi"].get("base_url",""), "channel_id": credentials["whapi"].get("channel_id",""), "configured": bool(credentials["whapi"].get("token"))},
-        "agent": {"enabled": credentials["agent"]["enabled"], "ai_powered": bool(credentials["agent"]["anthropic_key"] or credentials["agent"]["openai_key"])},
+        "snc":   {"api_url":credentials["snc"].get("api_url",""),"company_id":credentials["snc"].get("company_id",""),"authenticated":bool(credentials["snc"].get("access_token"))},
+        "whapi": {"base_url":credentials["whapi"].get("base_url",""),"configured":bool(credentials["whapi"].get("token"))},
+        "agent": {"enabled":credentials["agent"]["enabled"],"ai_powered":bool(credentials["agent"]["anthropic_key"] or credentials["agent"]["openai_key"])},
     }
 
+# ─── Sync routes ──────────────────────────────────────────────────────────────
+@app.post("/sync/customers")
+async def sync_customers(background_tasks: BackgroundTasks):
+    background_tasks.add_task(_sync_customers_task)
+    return {"status":"syncing","message":"Customer sync started in background"}
+
+async def _sync_customers_task():
+    page=1; total=0
+    while True:
+        count = await sync_customers_from_snc(page=page, per_page=100)
+        total += count
+        if count < 100: break
+        page += 1
+    logger.info("Customer sync complete: %d total", total)
+
+@app.post("/sync/products")
+async def sync_products(background_tasks: BackgroundTasks):
+    background_tasks.add_task(_sync_products_task)
+    return {"status":"syncing","message":"Product sync started in background"}
+
+async def _sync_products_task():
+    page=1; total=0
+    while True:
+        count = await sync_products_from_snc(page=page, per_page=100)
+        total += count
+        if count < 100: break
+        page += 1
+    logger.info("Product sync complete: %d total", total)
+
+@app.post("/sync/orders")
+async def sync_orders(background_tasks: BackgroundTasks):
+    background_tasks.add_task(sync_orders_from_snc)
+    return {"status":"syncing","message":"Order sync started in background"}
+
+@app.post("/sync/all")
+async def sync_all(background_tasks: BackgroundTasks):
+    background_tasks.add_task(_sync_customers_task)
+    background_tasks.add_task(_sync_products_task)
+    background_tasks.add_task(sync_orders_from_snc)
+    return {"status":"syncing","message":"Full sync started"}
+
+# ─── Data routes ──────────────────────────────────────────────────────────────
+@app.get("/data/customers")
+async def get_customers(page: int = 1, per_page: int = 50, search: str = ""):
+    db  = get_db()
+    if search:
+        rows  = db.execute("SELECT * FROM customers WHERE customer_name LIKE ? OR phone LIKE ? OR email LIKE ? LIMIT ? OFFSET ?",
+                           (f"%{search}%",f"%{search}%",f"%{search}%", per_page, (page-1)*per_page)).fetchall()
+        total = db.execute("SELECT COUNT(*) FROM customers WHERE customer_name LIKE ? OR phone LIKE ? OR email LIKE ?",
+                           (f"%{search}%",f"%{search}%",f"%{search}%")).fetchone()[0]
+    else:
+        rows  = db.execute("SELECT * FROM customers LIMIT ? OFFSET ?", (per_page, (page-1)*per_page)).fetchall()
+        total = db.execute("SELECT COUNT(*) FROM customers").fetchone()[0]
+    db.close()
+    return {"customers":[dict(r) for r in rows],"total":total,"page":page,"per_page":per_page}
+
+@app.get("/data/products")
+async def get_products(page: int = 1, per_page: int = 50, search: str = ""):
+    db = get_db()
+    if search:
+        rows  = db.execute("SELECT * FROM products WHERE name LIKE ? OR sku LIKE ? LIMIT ? OFFSET ?",
+                           (f"%{search}%",f"%{search}%", per_page, (page-1)*per_page)).fetchall()
+        total = db.execute("SELECT COUNT(*) FROM products WHERE name LIKE ? OR sku LIKE ?",
+                           (f"%{search}%",f"%{search}%")).fetchone()[0]
+    else:
+        rows  = db.execute("SELECT * FROM products LIMIT ? OFFSET ?", (per_page, (page-1)*per_page)).fetchall()
+        total = db.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+    db.close()
+    return {"products":[dict(r) for r in rows],"total":total,"page":page,"per_page":per_page}
+
+@app.get("/data/orders")
+async def get_orders(page: int = 1, per_page: int = 50, search: str = "", status: str = ""):
+    db = get_db()
+    where = "WHERE 1=1"
+    params: list = []
+    if search: where += " AND (order_number LIKE ? OR customer_id LIKE ?)"; params += [f"%{search}%",f"%{search}%"]
+    if status: where += " AND status=?"; params.append(status)
+    rows  = db.execute(f"SELECT * FROM orders {where} ORDER BY synced_at DESC LIMIT ? OFFSET ?",
+                       params+[per_page,(page-1)*per_page]).fetchall()
+    total = db.execute(f"SELECT COUNT(*) FROM orders {where}", params).fetchone()[0]
+    db.close()
+    return {"orders":[dict(r) for r in rows],"total":total,"page":page,"per_page":per_page}
+
+@app.get("/data/stats")
+async def get_stats():
+    db = get_db()
+    stats = {
+        "customers": db.execute("SELECT COUNT(*) FROM customers").fetchone()[0],
+        "products":  db.execute("SELECT COUNT(*) FROM products").fetchone()[0],
+        "orders":    db.execute("SELECT COUNT(*) FROM orders").fetchone()[0],
+        "pending":   db.execute("SELECT COUNT(*) FROM orders WHERE status='Pending'").fetchone()[0],
+        "conversations": db.execute("SELECT COUNT(DISTINCT chat_id) FROM conversation_log").fetchone()[0],
+        "messages":  db.execute("SELECT COUNT(*) FROM conversation_log").fetchone()[0],
+    }
+    db.close()
+    return stats
+
+# ─── Assignments ──────────────────────────────────────────────────────────────
+@app.post("/assignments")
+async def save_assignments(request: Request):
+    body = await request.json()
+    for chat_id, data in body.get("assignments",{}).items():
+        db_save_assignment(chat_id, data)
+    return {"status":"ok","saved":len(body.get("assignments",{}))}
+
+@app.get("/assignments")
+async def get_assignments():
+    return {"assignments": db_get_all_assignments()}
+
+# ─── Webhook ──────────────────────────────────────────────────────────────────
 @app.post("/process-message")
 async def process_message(request: Request, background_tasks: BackgroundTasks):
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
-
-    messages   = body.get("messages", [])
-    contact    = body.get("contacts", {})
-    company_id = body.get("company_id", credentials["snc"].get("company_id", ""))
-
-    logger.info(f"Webhook: {len(messages)} messages, company={company_id}")
-
+    messages   = body.get("messages",[])
+    contact    = body.get("contacts",{})
+    company_id = body.get("company_id", credentials["snc"].get("company_id",""))
     for message in messages:
-        if message.get("from_me"):
-            continue
-        if message.get("type") not in ("text", "image", "document", "audio", "voice"):
-            continue
-        background_tasks.add_task(
-            handle_message_background,
+        if message.get("from_me"): continue
+        if message.get("type") not in ("text","image","document","audio","voice"): continue
+        background_tasks.add_task(process_incoming_message,
             message=message, contact=contact,
-            company_id=company_id, chat_id=message.get("chat_id", ""),
-        )
+            company_id=company_id, chat_id=message.get("chat_id",""))
+    return JSONResponse({"status":"ok","received":len(messages)})
 
-    return JSONResponse({"status": "ok", "received": len(messages)})
-
-async def handle_message_background(message: Dict, contact: Dict, company_id: str, chat_id: str):
-    try:
-        reply = await process_incoming_message(
-            message=message, contact=contact,
-            company_id=company_id, chat_id=chat_id,
-        )
-        if reply:
-            sender_phone = message.get("from", "")
-            await send_whatsapp_reply(
-                contact_id=chat_id,
-                message=reply,
-                phone_number=sender_phone if not chat_id.endswith("@g.us") else None,
-            )
-    except Exception as e:
-        logger.error(f"handle_message error: {e}", exc_info=True)
-
-# ─── Proxy Routes ─────────────────────────────────────────────────────────────
-
+# ─── Proxy routes ─────────────────────────────────────────────────────────────
 @app.get("/proxy/whapi/chats")
-async def proxy_whapi_chats(page: int = 1, count: int = 20):
-    base = credentials["whapi"].get("base_url", "https://gate.whapi.cloud")
+async def proxy_whapi_chats(page: int=1, count: int=20):
+    base = credentials["whapi"].get("base_url","https://gate.whapi.cloud")
     async with httpx.AsyncClient(timeout=15) as client:
         try:
-            resp = await client.get(f"{base}/chats", headers=whapi_headers(), params={"page": page, "count": count})
+            resp = await client.get(f"{base}/chats", headers=whapi_headers(), params={"page":page,"count":count})
             return resp.json()
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=str(e))
+        except Exception as e: raise HTTPException(status_code=502, detail=str(e))
 
 @app.get("/proxy/whapi/messages/{chat_id}")
-async def proxy_whapi_messages(chat_id: str, page: int = 1, count: int = 40):
-    base = credentials["whapi"].get("base_url", "https://gate.whapi.cloud")
+async def proxy_whapi_messages(chat_id: str, page: int=1, count: int=40):
+    base = credentials["whapi"].get("base_url","https://gate.whapi.cloud")
     async with httpx.AsyncClient(timeout=15) as client:
         try:
-            resp = await client.get(f"{base}/messages/list/{chat_id}", headers=whapi_headers(), params={"page": page, "count": count})
+            resp = await client.get(f"{base}/messages/list/{chat_id}", headers=whapi_headers(), params={"page":page,"count":count})
             return resp.json()
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=str(e))
+        except Exception as e: raise HTTPException(status_code=502, detail=str(e))
+
+@app.get("/proxy/whapi/group/{chat_id}")
+async def proxy_whapi_group(chat_id: str):
+    base = credentials["whapi"].get("base_url","https://gate.whapi.cloud")
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            resp = await client.get(f"{base}/groups/{chat_id}", headers=whapi_headers())
+            return resp.json()
+        except Exception as e: raise HTTPException(status_code=502, detail=str(e))
 
 @app.post("/proxy/whapi/send")
 async def proxy_whapi_send(payload: SendMessagePayload):
-    success = await send_whatsapp_reply(contact_id=payload.contact_id, message=payload.body, phone_number=payload.phone_number)
-    if not success:
-        raise HTTPException(status_code=502, detail="Failed to send message")
-    return {"status": "ok", "sent": True}
-
-@app.get("/proxy/snc/test-login")
-async def test_login_format(request: Request):
-    """Debug endpoint — shows exactly what we send to SNC."""
-    api_url = credentials["snc"].get("api_url") or "https://enterprise.sellnchill.com/api"
-    return {
-        "login_url":    f"{api_url}/login",
-        "method":       "POST",
-        "body_format":  "multipart/form-data",
-        "fields":       ["username", "password", "grant_type=password", "notification=false"],
-        "snc_api_url":  api_url,
-        "has_token":    bool(credentials["snc"].get("access_token")),
-    }
+    ok = await whapi_send(payload.contact_id, payload.body)
+    if not ok: raise HTTPException(status_code=502, detail="Failed to send")
+    return {"status":"ok","sent":True}
 
 @app.post("/proxy/snc/login")
 async def proxy_snc_login(request: Request):
-    """
-    Proxy the SNC login — fixes CORS and 405 issues when browser calls SNC directly.
-    """
     body     = await request.json()
-    api_url  = body.get("api_url", "")
-    username = body.get("username", "")
-    password = body.get("password", "")
-
+    api_url  = body.get("api_url","").rstrip("/")
+    username = body.get("username","")
+    password = body.get("password","")
     if not api_url or not username or not password:
         raise HTTPException(status_code=400, detail="api_url, username and password required")
-
-    # Clean URL
-    api_url = api_url.rstrip("/")
     if not api_url.endswith("/api"):
-        if "/api/" in api_url:
-            api_url = api_url.split("/api/")[0] + "/api"
-        else:
-            api_url = api_url + "/api"
-
-    login_url = f"{api_url}/login"
-    logger.info(f"Proxying SNC login → {login_url}")
-
+        api_url = api_url + "/api" if "/api" not in api_url else api_url.split("/api")[0]+"/api"
+    logger.info("Proxying SNC login → %s/login", api_url)
     fd = {"username": username, "password": password, "grant_type": "password", "notification": "false"}
-
     try:
         async with httpx.AsyncClient(timeout=20) as client:
-            # SNC encrypts credentials in the browser before sending.
-            # We send them as-is (already encrypted by the frontend or as plain text).
-            # SNC enterprise uses Fernet encryption on the frontend — we pass through whatever the user provides.
-            resp = await client.post(login_url, data=fd)
-            logger.info(f"SNC login status: {resp.status_code}")
-            logger.info(f"SNC login body: {resp.text[:500]}")
-
-            try:
-                data = resp.json()
-            except Exception:
-                data = {"raw": resp.text}
-
-            if resp.status_code not in (200, 201):
-                detail = data.get("detail") or data.get("message") or data.get("error") or f"SNC returned {resp.status_code}: {resp.text[:300]}"
-                raise HTTPException(status_code=resp.status_code, detail=detail)
-
+            resp = await client.post(f"{api_url}/login", data=fd)
+            logger.info("SNC login: %s | %s", resp.status_code, resp.text[:300])
+            data = resp.json()
+            if resp.status_code not in (200,201):
+                raise HTTPException(status_code=resp.status_code,
+                    detail=data.get("detail") or data.get("message") or f"SNC returned {resp.status_code}")
             if data.get("access_token"):
                 credentials["snc"]["api_url"]      = api_url
                 credentials["snc"]["access_token"]  = data["access_token"]
-                credentials["snc"]["user_id"]       = data.get("user_id", "")
+                credentials["snc"]["user_id"]       = data.get("user_id","")
                 credentials["snc"]["username"]      = username
-                logger.info(f"SNC login SUCCESS — user_id={data.get('user_id')}")
             return data
-    except HTTPException:
-        raise
+    except HTTPException: raise
     except Exception as e:
-        logger.error(f"SNC login proxy error: {e}")
         raise HTTPException(status_code=502, detail=str(e))
-
 
 @app.post("/proxy/snc/customers")
 async def proxy_snc_customers(request: Request):
     body = await request.json()
-    result = await snc_call("/customers/get", {"data": {"filter_by": {"search_on": ["customer_id","customer_name","customer_phone","customer_email"], "exact_match": False, "pagination": {"page_no":1,"no_of_recs":40,"sort_by":"cts","order_by":False}, **body.get("filter_by", {})}}})
-    if result is None:
-        raise HTTPException(status_code=502, detail="SNC API call failed")
+    result = await snc_call("/customers/get", {"data": {"filter_by": {
+        "search_on": ["customer_id","customer_name","customer_phone","customer_email"],
+        "exact_match": False,
+        "pagination": {"page_no":1,"no_of_recs":100,"sort_by":"cts","order_by":False},
+        **body.get("filter_by",{})
+    }}})
+    if result is None: raise HTTPException(status_code=502, detail="SNC API failed")
     return result
 
 @app.post("/proxy/snc/products")
 async def proxy_snc_products(request: Request):
     body = await request.json()
-    search_text = body.get("search_text", [])
-    result = await snc_call("/products/list", {"data": {"filter_by": {"search_text": search_text if isinstance(search_text, list) else [search_text], "search_on": ["name","sku","product_code"], "confidence": 0.5, "exact_match": False, "pagination": {"page_no":1,"no_of_recs":40,"sort_by":"cts","order_by":False}, "view":"individual","status":"All","include_columns":["name","sku","prices","uom","quantity","images"],"merged":True,"bundles":False}}})
-    if result is None:
-        raise HTTPException(status_code=502, detail="SNC API call failed")
+    search_text = body.get("search_text",[])
+    result = await snc_call("/products/list", {"data": {"filter_by": {
+        "search_text": search_text if isinstance(search_text,list) else [search_text],
+        "search_on": ["name","sku","product_code"],
+        "confidence": 0.5, "exact_match": False,
+        "pagination": {"page_no":1,"no_of_recs":40,"sort_by":"cts","order_by":False},
+        "view":"individual","status":"All",
+        "include_columns":["name","sku","prices","uom","quantity","images"],
+        "merged":True,"bundles":False
+    }}})
+    if result is None: raise HTTPException(status_code=502, detail="SNC API failed")
     return result
 
 @app.post("/proxy/snc/orders")
 async def proxy_snc_orders(request: Request):
     body = await request.json()
-    date_range = body.get("date_range", [])
-    if not date_range:
-        today = datetime.now().strftime("%d-%m-%Y")
-        thirty_ago = (datetime.now() - timedelta(days=30)).strftime("%d-%m-%Y")
-        date_range = [thirty_ago, today]
-    result = await snc_call("/b2b/orders/get", {"data": {"include_orders": True, "filter_by": {"source":"B2B","platform":"Whatsapp","store_id":[],"branch_id":[],"status":body.get("status","All"),"date_range":date_range,"search_on":["order_number","reference","store","tags"],"search_text":"","exact_match":False,"pagination":{"page_no":1,"no_of_recs":40,"sort_by":"order_cts","order_by":False},"whatsapp_contact_id":body.get("whatsapp_contact_id",[]),"review_required":False}}})
-    if result is None:
-        raise HTTPException(status_code=502, detail="SNC API call failed")
+    today     = datetime.now().strftime("%d-%m-%Y")
+    from_date = (datetime.now() - timedelta(days=30)).strftime("%d-%m-%Y")
+    date_range = body.get("date_range",[from_date, today])
+    result = await snc_call("/b2b/orders/get", {"data": {"include_orders": True, "filter_by": {
+        "source":"B2B","platform":"Whatsapp","store_id":[],"branch_id":[],
+        "status":body.get("status","All"),"date_range":date_range,
+        "search_on":["order_number","reference","store","tags"],
+        "search_text":"","exact_match":False,
+        "pagination":{"page_no":1,"no_of_recs":40,"sort_by":"order_cts","order_by":False},
+        "whatsapp_contact_id":body.get("whatsapp_contact_id",[]),
+        "review_required":False
+    }}})
+    if result is None: raise HTTPException(status_code=502, detail="SNC API failed")
     return result
+
+@app.get("/agent/status")
+async def agent_status():
+    return {"enabled":credentials["agent"]["enabled"],
+            "ai_powered":bool(credentials["agent"]["anthropic_key"] or credentials["agent"]["openai_key"]),
+            "model":"claude" if credentials["agent"]["anthropic_key"] else "openai" if credentials["agent"]["openai_key"] else "rule-based",
+            "active_chats":len(conversation_memory)}
+
+@app.post("/agent/toggle")
+async def toggle_agent(request: Request):
+    body = await request.json()
+    credentials["agent"]["enabled"] = body.get("enabled",True)
+    return {"enabled":credentials["agent"]["enabled"]}
+
+@app.post("/agent/test")
+async def test_agent(request: Request):
+    body   = await request.json()
+    text   = body.get("message","I want 5 boxes chicken karaage")
+    sender = body.get("sender","Test User")
+    analysis = await analyze_with_ai(text, sender, None, [])
+    reply    = build_reply(analysis, sender)
+    return {"input":text,"intent":analysis.get("intent"),"confidence":analysis.get("confidence"),
+            "items":analysis.get("items",[]),"method":analysis.get("method"),"reply":reply}
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False, log_level="info")
+    port = int(os.getenv("PORT",8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
