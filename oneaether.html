@@ -1,1820 +1,853 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>oneaether.ai — AI Business Platform</title>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
-  <style>
-    body { margin: 0; padding: 0; background: #0a0b0f; }
-    #root { width: 100vw; height: 100vh; }
-    /* Agent URL banner */
-    #agent-banner {
-      position: fixed; bottom: 16px; right: 16px; z-index: 9999;
-      background: #11131a; border: 1px solid #1e2333; border-radius: 10px;
-      padding: 10px 14px; font-family: 'DM Sans', sans-serif; font-size: 12px;
-      color: #8892a4; display: flex; align-items: center; gap: 8px;
-      box-shadow: 0 4px 20px #00000060;
+"""
+oneaether.ai Agent Server - Railway Edition
+AI-powered WhatsApp order intent detection & processing
+"""
+
+import asyncio
+import json
+import logging
+import os
+import re
+import time
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import httpx
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("oneaether")
+
+# ─── Global state ─────────────────────────────────────────────────────────────
+credentials: Dict[str, Any] = {
+    "snc": {
+        "api_url":      os.getenv("SNC_API_URL", ""),
+        "access_token": os.getenv("SNC_TOKEN", ""),
+        "user_id":      os.getenv("SNC_USER_ID", ""),
+        "username":     os.getenv("SNC_USERNAME", ""),
+        "company_id":   os.getenv("SNC_COMPANY_ID", ""),
+        "timezone":     os.getenv("SNC_TIMEZONE", "Asia/Singapore"),
+    },
+    "whapi": {
+        "base_url":   os.getenv("WHAPI_BASE_URL", "https://gate.whapi.cloud"),
+        "token":      os.getenv("WHAPI_TOKEN", ""),
+        "channel_id": os.getenv("WHAPI_CHANNEL_ID", ""),
+    },
+    "agent": {
+        "enabled":        os.getenv("AGENT_ENABLED", "true").lower() == "true",
+        "anthropic_key":  os.getenv("ANTHROPIC_API_KEY", ""),
+        "openai_key":     os.getenv("OPENAI_API_KEY", ""),
     }
-    #agent-banner input {
-      background: #0a0b0f; border: 1px solid #1e2333; border-radius: 6px;
-      color: #e8eaf0; padding: 4px 8px; font-size: 11px; font-family: monospace;
-      width: 240px; outline: none;
+}
+
+# Conversation memory: chat_id -> last few messages for context
+conversation_memory: Dict[str, List[Dict]] = {}
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("oneaether.ai starting on port %s", os.getenv("PORT", 8000))
+    logger.info("AI Agent: %s", "ENABLED" if credentials["agent"]["enabled"] else "DISABLED")
+    if credentials["agent"]["anthropic_key"]:
+        logger.info("AI Provider: Claude (Anthropic)")
+    elif credentials["agent"]["openai_key"]:
+        logger.info("AI Provider: OpenAI GPT-4o-mini")
+    else:
+        logger.info("AI Provider: rule-based fallback (no API key set)")
+    yield
+    logger.info("oneaether.ai shutting down")
+
+app = FastAPI(title="oneaether.ai", version="1.0.0", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+# ─── Pydantic models ──────────────────────────────────────────────────────────
+class CredentialsPayload(BaseModel):
+    snc:   Optional[Dict[str, str]] = None
+    whapi: Optional[Dict[str, str]] = None
+    agent: Optional[Dict[str, str]] = None
+
+class SendMessagePayload(BaseModel):
+    contact_id:   str
+    body:         str
+    type:         str = "text"
+    phone_number: Optional[str] = None
+    mentions:     Optional[List[str]] = None
+
+# ─── SNC helpers ──────────────────────────────────────────────────────────────
+def snc_headers():
+    return {"Authorization": f"Bearer {credentials['snc'].get('access_token','')}", "Content-Type": "application/json"}
+
+def snc_base():
+    return {
+        "company_id":   credentials["snc"].get("company_id", ""),
+        "user_id":      credentials["snc"].get("user_id", ""),
+        "username":     credentials["snc"].get("username", ""),
+        "timezone":     credentials["snc"].get("timezone", "Asia/Singapore"),
+        "request_from": "WEB",
     }
-    #agent-banner input:focus { border-color: #00d9a3; }
-    #agent-banner button {
-      background: #00d9a3; color: #000; border: none; border-radius: 6px;
-      padding: 4px 10px; font-size: 11px; font-weight: 700; cursor: pointer;
-    }
-    #agent-banner .dot { width:8px;height:8px;border-radius:50%;background:#8892a4;flex-shrink:0; }
-    #agent-banner .dot.on { background:#00d9a3; animation: pulse 2s infinite; }
-    @keyframes pulse { 0%,100%{opacity:1}50%{opacity:.4} }
-  </style>
-</head>
-<body>
-<div id="root"></div>
 
-<!-- Agent URL banner - type your Railway/backend URL here -->
-<div id="agent-banner">
-  <div class="dot" id="agent-dot"></div>
-  <span>Backend:</span>
-  <input id="agent-url-input" type="text" placeholder="https://your-app.railway.app" value="https://oneaether-agent-production.up.railway.app" onfocus="if(!this.value)this.value=window.AGENT_URL" 
-         
-         onchange="updateAgentUrl(this.value)"/>
-  <button onclick="testAgent()">Test</button>
-</div>
+def whapi_headers():
+    return {"Authorization": f"Bearer {credentials['whapi'].get('token','')}", "Content-Type": "application/json"}
 
-<script>
-  // Global agent URL — UI reads this
-  // Auto-detect: if served from Railway, backend is same origin
-  window.AGENT_URL = "https://oneaether-agent-production.up.railway.app";
-  
-  function updateAgentUrl(url) {
-    window.AGENT_URL = url.trim();
-    // Also update any React state if App is mounted
-    if (window._setAgentUrl) window._setAgentUrl(url.trim());
-  }
-  
-  // Set input to current origin on load
-  window.addEventListener("load", function() {
-    const inp = document.getElementById("agent-url-input");
-    if (inp) inp.value = window.AGENT_URL;
-    // Auto-test on load
-    setTimeout(testAgentSilent, 1000);
-  });
+async def poll_job(job_id: str, timeout: int = 30) -> Optional[Dict]:
+    api_url = credentials["snc"].get("api_url", "")
+    if not api_url:
+        return None
+    deadline = time.time() + timeout
+    async with httpx.AsyncClient(timeout=15) as client:
+        while time.time() < deadline:
+            try:
+                resp = await client.get(f"{api_url}/job/{job_id}", headers=snc_headers())
+                data = resp.json()
+                if data.get("process_status") == "processed" or data.get("result"):
+                    return data
+                await asyncio.sleep(1.5)
+            except Exception as e:
+                logger.warning(f"Job poll error: {e}")
+                await asyncio.sleep(2)
+    return None
 
-  async function testAgentSilent() {
-    const url = window.AGENT_URL;
-    const dot = document.getElementById("agent-dot");
-    try {
-      const r = await fetch(url + "/health", { signal: AbortSignal.timeout(5000) });
-      if (r.ok) { dot.className = "dot on"; dot.style.background = ""; }
-    } catch(e) { dot.style.background = "#ff4d6d"; }
-  }
+async def snc_call(endpoint: str, body: Dict) -> Optional[Dict]:
+    api_url = credentials["snc"].get("api_url", "")
+    if not api_url:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(f"{api_url}{endpoint}", json={**snc_base(), **body}, headers=snc_headers())
+            data = resp.json()
+            if not data.get("status", {}).get("success"):
+                logger.error(f"SNC error on {endpoint}: {data}")
+                return None
+            job_id = data.get("job_id")
+            return await poll_job(job_id) if job_id else data
+    except Exception as e:
+        logger.error(f"SNC call failed ({endpoint}): {e}")
+        return None
 
-  async function testAgent() {
-    const url = document.getElementById("agent-url-input").value.trim();
-    const dot = document.getElementById("agent-dot");
-    dot.style.background = "#f59e0b";
-    try {
-      const r = await fetch(url + "/health", { signal: AbortSignal.timeout(5000) });
-      if (r.ok) {
-        dot.className = "dot on";
-        dot.style.background = "";
-        alert("✓ Backend connected! Agent is running.");
-      } else {
-        throw new Error("HTTP " + r.status);
-      }
-    } catch(e) {
-      dot.className = "dot";
-      dot.style.background = "#ff4d6d";
-      alert("✗ Could not reach backend: " + e.message + "\n\nMake sure your backend is deployed and the URL is correct.");
-    }
-  }
-</script>
+async def send_whatsapp_reply(contact_id: str, message: str, phone_number: Optional[str] = None) -> bool:
+    api_url = credentials["snc"].get("api_url", "")
+    if not api_url:
+        logger.warning("Cannot send reply — SNC not configured")
+        return False
+    payload = {**snc_base(), "data": {"contact_id": contact_id, "type": "text", "body": message,
+                                       **({"phone_number": phone_number} if phone_number else {})}}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(f"{api_url}/whatsapp/messages/send", json=payload, headers=snc_headers())
+            return resp.json().get("status", {}).get("success", False)
+    except Exception as e:
+        logger.error(f"send_reply failed: {e}")
+        return False
 
-<script type="text/babel">
-const { useState, useEffect, useRef } = React;
+# ─── Intent Detection ─────────────────────────────────────────────────────────
 
-
-// ─── CONSTANTS ──────────────────────────────────────────────────────────────
-const API_BASE = "http://158.140.133.83:5000";
-
-const INITIAL_CUSTOMERS = [
-  { id: 1, name: "Ahmad Razali",   phone: "+60123456789", orders: 42, revenue: 18450, lastOrder: "2025-02-20", churnRisk: 5,  segment: "VIP" },
-  { id: 2, name: "Siti Noor",      phone: "+60187654321", orders: 28, revenue: 9800,  lastOrder: "2025-01-10", churnRisk: 72, segment: "At Risk" },
-  { id: 3, name: "Lee Wei Ming",   phone: "+60112233445", orders: 35, revenue: 14200, lastOrder: "2025-02-22", churnRisk: 12, segment: "Loyal" },
-  { id: 4, name: "Priya Krishnan", phone: "+60198765432", orders: 8,  revenue: 2400,  lastOrder: "2024-11-15", churnRisk: 88, segment: "Churned" },
-  { id: 5, name: "Mohd Faizal",    phone: "+60166778899", orders: 19, revenue: 7600,  lastOrder: "2025-02-18", churnRisk: 30, segment: "Regular" },
-  { id: 6, name: "Jenny Tan",      phone: "+60134455667", orders: 55, revenue: 24000, lastOrder: "2025-02-25", churnRisk: 3,  segment: "VIP" },
-  { id: 7, name: "Rajan Pillai",   phone: "+60177889900", orders: 12, revenue: 4300,  lastOrder: "2025-02-01", churnRisk: 45, segment: "Regular" },
-  { id: 8, name: "Nurul Aina",     phone: "+60199001122", orders: 6,  revenue: 1800,  lastOrder: "2024-12-20", churnRisk: 68, segment: "At Risk" },
-];
-
-const INITIAL_SEGMENTS = [
-  { id:"vip",     name:"VIP",     color:"#ffd700", icon:"👑", description:"Top revenue customers",             type:"rule",   rules:[{field:"revenue",op:"gte",value:15000},{field:"orders",op:"gte",value:30}], customerIds:[1,6], aiGenerated:false, createdAt:"2025-01-01" },
-  { id:"loyal",   name:"Loyal",   color:"#00d9a3", icon:"💚", description:"Consistent buyers, low churn risk", type:"rule",   rules:[{field:"churnRisk",op:"lte",value:20},{field:"orders",op:"gte",value:20}],  customerIds:[3],   aiGenerated:false, createdAt:"2025-01-01" },
-  { id:"regular", name:"Regular", color:"#60a5fa", icon:"⭐", description:"Average engagement customers",      type:"manual", rules:[],                                                                            customerIds:[5,7], aiGenerated:false, createdAt:"2025-01-01" },
-  { id:"at-risk", name:"At Risk", color:"#f59e0b", icon:"⚠️", description:"Customers at risk of churning",    type:"rule",   rules:[{field:"churnRisk",op:"gte",value:60}],                                       customerIds:[2,8], aiGenerated:false, createdAt:"2025-01-01" },
-  { id:"churned", name:"Churned", color:"#ff4d6d", icon:"💔", description:"Inactive, 90+ days no order",      type:"rule",   rules:[{field:"churnRisk",op:"gte",value:80}],                                       customerIds:[4],   aiGenerated:false, createdAt:"2025-01-01" },
-];
-
-const AI_RECS = [
-  { id:"ai-whales",      name:"Whales",          color:"#a78bfa", icon:"🐋", description:"Ultra-high value customers in the top 5% by revenue. Premium treatment maximises LTV.", type:"rule", rules:[{field:"revenue",op:"gte",value:20000}], customerIds:[6], aiGenerated:true, confidence:94, aiReason:"Customers with revenue ≥ RM20,000 generate disproportionate value. Isolating them enables white-glove service and prevents churn at your highest-value tier.", suggestedAction:"Send personalised re-order reminder + exclusive 20% discount" },
-  { id:"ai-rising",      name:"Rising Stars",    color:"#f472b6", icon:"🚀", description:"Mid-tier customers showing order frequency growth — prime upsell candidates.", type:"rule", rules:[{field:"orders",op:"gte",value:15},{field:"revenue",op:"lte",value:10000}], customerIds:[5,7], aiGenerated:true, confidence:87, aiReason:"These customers order frequently but spend below average. A targeted bundle upgrade campaign could increase AOV by 30-50%.", suggestedAction:"Bundle upsell campaign with 15% off Premium tier" },
-  { id:"ai-winback",     name:"Win-Back Targets",color:"#fb923c", icon:"🎯", description:"Previously active customers who've gone quiet — high ROI re-engagement window.", type:"rule", rules:[{field:"churnRisk",op:"gte",value:60},{field:"orders",op:"gte",value:10}], customerIds:[2,8], aiGenerated:true, confidence:91, aiReason:"Customers with churn risk >60% who had ≥10 orders before. Win-back cost is 5× cheaper than new acquisition.", suggestedAction:"WhatsApp re-engagement sequence with a 'We miss you' offer" },
-];
-
-const MOCK_PRODUCTS = [
-  { id:1, name:"Premium Bundle",  sku:"PRB-001", sold:320, revenue:48000, growth:24  },
-  { id:2, name:"Starter Pack",    sku:"STP-002", sold:540, revenue:21600, growth:8   },
-  { id:3, name:"Enterprise Suite",sku:"ENT-003", sold:90,  revenue:63000, growth:41  },
-  { id:4, name:"Basic Plan",      sku:"BSC-004", sold:800, revenue:16000, growth:-5  },
-  { id:5, name:"Add-on Module",   sku:"ADO-005", sold:210, revenue:10500, growth:15  },
-];
-
-const MOCK_WA_CHATS = [
-  { id:1, name:"Ahmad Razali", phone:"+60123456789", avatar:"AR", lastMsg:"I want to order 3 boxes of Premium Bundle", time:"10:32 AM", unread:2, online:true,
-    messages:[{id:1,from:"them",text:"Hello, good morning!",time:"10:30 AM",intent:null},{id:2,from:"them",text:"I want to order 3 boxes of Premium Bundle",time:"10:32 AM",intent:"ORDER"}]},
-  { id:2, name:"Siti Noor", phone:"+60187654321", avatar:"SN", lastMsg:"Can I change my order to 5 units instead?", time:"09:45 AM", unread:1, online:false,
-    messages:[{id:1,from:"them",text:"Hi I ordered 2 units yesterday",time:"09:40 AM",intent:null},{id:2,from:"them",text:"Can I change my order to 5 units instead?",time:"09:45 AM",intent:"AMEND_ORDER"}]},
-  { id:3, name:"Lee Wei Ming", phone:"+60112233445", avatar:"LW", lastMsg:"What is the price for Enterprise Suite?", time:"Yesterday", unread:0, online:true,
-    messages:[{id:1,from:"them",text:"What is the price for Enterprise Suite?",time:"Yesterday",intent:"ENQUIRY"},{id:2,from:"us",text:"Hi Lee! Enterprise Suite is RM700/month. Would you like more details?",time:"Yesterday",intent:null}]},
-  { id:4, name:"Jenny Tan", phone:"+60134455667", avatar:"JT", lastMsg:"🎙️ Voice message", time:"Yesterday", unread:3, online:false,
-    messages:[{id:1,from:"them",text:"🎙️ [Voice message - 0:12] 'Order two premium bundles please'",time:"Yesterday",intent:"VOICE_ORDER"}]},
-];
-
-const INTENT_CONFIG = {
-  ORDER:       {label:"Order",       color:"#00d9a3",bg:"#00d9a320"},
-  AMEND_ORDER: {label:"Amend Order", color:"#f59e0b",bg:"#f59e0b20"},
-  ENQUIRY:     {label:"Enquiry",     color:"#60a5fa",bg:"#60a5fa20"},
-  VOICE_ORDER: {label:"Voice Order", color:"#a78bfa",bg:"#a78bfa20"},
-  IMAGE_ORDER: {label:"Image Order", color:"#f472b6",bg:"#f472b620"},
-};
-
-const RULE_FIELDS = [
-  {key:"revenue",   label:"Revenue (RM)"},
-  {key:"orders",    label:"Total Orders"},
-  {key:"churnRisk", label:"Churn Risk (%)"},
-];
-const RULE_OPS = [
-  {key:"gte",label:"≥"},{key:"lte",label:"≤"},
-  {key:"gt", label:">"},{key:"lt", label:"<"},{key:"eq",label:"="},
-];
-const PALETTE = ["#ffd700","#00d9a3","#60a5fa","#f59e0b","#ff4d6d","#a78bfa","#f472b6","#fb923c","#34d399","#e879f9"];
-const AV_CLASSES = ["av-1","av-2","av-3","av-4","av-5","av-6","av-7","av-8"];
-const getAV = i => AV_CLASSES[i % AV_CLASSES.length];
-
-function evalRule(c, r) {
-  const v = c[r.field], rv = Number(r.value);
-  if(r.op==="gte") return v >= rv;
-  if(r.op==="lte") return v <= rv;
-  if(r.op==="gt")  return v > rv;
-  if(r.op==="lt")  return v < rv;
-  if(r.op==="eq")  return v === rv;
-  return false;
-}
-const matchRules = (c, rules) => rules.length > 0 && rules.every(r => evalRule(c, r));
-
-// ─── CSS ─────────────────────────────────────────────────────────────────────
-const css = `
-  @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500&display=swap');
-  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-  :root{--bg:#0a0b0f;--bg2:#11131a;--bg3:#181b24;--border:#1e2333;--accent:#00d9a3;--accent2:#7c4dff;--text:#e8eaf0;--text2:#8892a4;--danger:#ff4d6d;--warn:#f59e0b;--fh:'Syne',sans-serif;--fb:'DM Sans',sans-serif;--r:12px;--r2:8px}
-  body{background:var(--bg);color:var(--text);font-family:var(--fb);font-size:14px;overflow:hidden}
-  ::-webkit-scrollbar{width:4px;height:4px}::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
-  .app{display:flex;height:100vh;width:100vw;overflow:hidden}
-  .sidebar{width:220px;min-width:220px;background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;z-index:10}
-  .logo{padding:20px 18px 16px;border-bottom:1px solid var(--border)}
-  .logo-mark{font-family:var(--fh);font-weight:800;font-size:17px;letter-spacing:-0.5px}
-  .logo-mark span{color:var(--accent)}
-  .logo-sub{font-size:10px;color:var(--text2);letter-spacing:2px;text-transform:uppercase;margin-top:2px}
-  .nav{flex:1;padding:12px 0;overflow-y:auto}
-  .nav-section{padding:8px 18px 4px;font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--text2);font-weight:600}
-  .nav-item{display:flex;align-items:center;gap:10px;padding:9px 18px;cursor:pointer;color:var(--text2);font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent;margin:1px 0}
-  .nav-item:hover{color:var(--text);background:var(--bg3)}
-  .nav-item.active{color:var(--accent);background:#00d9a308;border-left-color:var(--accent)}
-  .nav-badge{margin-left:auto;background:var(--danger);color:white;font-size:10px;font-weight:700;padding:1px 6px;border-radius:10px}
-  .sidebar-footer{padding:14px 18px;border-top:1px solid var(--border)}
-  .user-chip{display:flex;align-items:center;gap:10px}
-  .user-av{width:30px;height:30px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--accent2));display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:white;flex-shrink:0}
-  .main{flex:1;display:flex;flex-direction:column;overflow:hidden}
-  .topbar{height:52px;min-height:52px;background:var(--bg2);border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 24px;gap:16px}
-  .topbar-title{font-family:var(--fh);font-weight:700;font-size:16px}
-  .topbar-sub{font-size:12px;color:var(--text2);margin-top:1px}
-  .topbar-right{margin-left:auto;display:flex;align-items:center;gap:10px}
-  .btn{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;border-radius:var(--r2);font-size:12px;font-weight:600;cursor:pointer;border:none;transition:all .15s;font-family:var(--fb);white-space:nowrap}
-  .btn-primary{background:var(--accent);color:#000}.btn-primary:hover{background:#00f0b5}
-  .btn-ghost{background:var(--bg3);color:var(--text2);border:1px solid var(--border)}.btn-ghost:hover{color:var(--text);border-color:var(--text2)}
-  .btn-danger{background:#ff4d6d22;color:var(--danger);border:1px solid #ff4d6d44}.btn-danger:hover{background:#ff4d6d33}
-  .btn-ai{background:linear-gradient(135deg,#7c4dff,#a855f7);color:white}.btn-ai:hover{filter:brightness(1.1)}
-  .btn-sm{padding:5px 10px;font-size:11px}
-  .content{flex:1;overflow-y:auto;padding:24px}
-  .card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:20px}
-  .grid-4{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
-  .grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
-  .grid-2{display:grid;grid-template-columns:repeat(2,1fr);gap:16px}
-  .stat-label{font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--text2);font-weight:600}
-  .stat-value{font-family:var(--fh);font-size:22px;font-weight:800;margin:6px 0 2px}
-  .up{color:var(--accent)}.down{color:var(--danger)}
-  table{width:100%;border-collapse:collapse}
-  th{text-align:left;padding:10px 14px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--text2);border-bottom:1px solid var(--border);font-weight:600}
-  td{padding:12px 14px;border-bottom:1px solid var(--border);font-size:13px}
-  tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg3)}
-  .badge{display:inline-block;padding:3px 9px;border-radius:20px;font-size:11px;font-weight:600}
-  .badge-vip{background:#ffd70020;color:#ffd700}.badge-loyal{background:#00d9a320;color:var(--accent)}
-  .badge-regular{background:#60a5fa20;color:#60a5fa}.badge-at-risk{background:#f59e0b20;color:var(--warn)}
-  .badge-churned{background:#ff4d6d20;color:var(--danger)}
-  .churn-bar{height:4px;border-radius:2px;background:var(--border);overflow:hidden;width:80px}
-  .churn-fill{height:100%;border-radius:2px;transition:width .5s}
-  .ai-messages{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px}
-  .ai-msg{max-width:75%;padding:12px 16px;border-radius:16px;font-size:13px;line-height:1.6}
-  .ai-msg.ai{background:var(--bg3);border:1px solid var(--border);border-radius:4px 16px 16px 16px}
-  .ai-msg.user{background:var(--accent);color:#000;border-radius:16px 4px 16px 16px;align-self:flex-end;font-weight:500}
-  .ai-input-row{padding:16px;border-top:1px solid var(--border);display:flex;gap:10px}
-  .ai-input,.wa-input,.search-input,.form-input{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r2);color:var(--text);font-family:var(--fb);outline:none;transition:border-color .15s}
-  .ai-input{flex:1;padding:10px 14px;font-size:13px}.ai-input:focus{border-color:var(--accent)}
-  .form-input{width:100%;padding:9px 12px;font-size:13px}.form-input:focus{border-color:var(--accent)}
-  .search-input{padding:8px 12px;font-size:13px;width:200px}.search-input:focus{border-color:var(--accent)}
-  .ai-typing{display:flex;gap:4px;align-items:center;padding:4px 0}
-  .ai-typing span{width:6px;height:6px;border-radius:50%;background:var(--text2);animation:bounce 1.2s infinite}
-  .ai-typing span:nth-child(2){animation-delay:.2s}.ai-typing span:nth-child(3){animation-delay:.4s}
-  @keyframes bounce{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-6px)}}
-  .wa-layout{display:flex;height:100%;overflow:hidden}
-  .wa-sidebar{width:320px;min-width:320px;border-right:1px solid var(--border);display:flex;flex-direction:column;background:var(--bg2)}
-  .wa-search{padding:12px 14px;border-bottom:1px solid var(--border)}
-  .wa-search input{width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:20px;padding:8px 14px;color:var(--text);font-size:13px;outline:none}
-  .wa-list{flex:1;overflow-y:auto}
-  .wa-chat-item{display:flex;align-items:center;gap:12px;padding:12px 14px;cursor:pointer;border-bottom:1px solid var(--border);transition:background .1s}
-  .wa-chat-item:hover,.wa-chat-item.active{background:var(--bg3)}
-  .wa-avatar{width:42px;height:42px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px;color:white;flex-shrink:0;position:relative}
-  .wa-online-dot{position:absolute;bottom:2px;right:2px;width:10px;height:10px;border-radius:50%;background:var(--accent);border:2px solid var(--bg2)}
-  .wa-chat-info{flex:1;min-width:0}
-  .wa-chat-name{font-weight:600;font-size:13px}
-  .wa-chat-preview{font-size:12px;color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:2px}
-  .wa-chat-meta{display:flex;flex-direction:column;align-items:flex-end;gap:4px}
-  .wa-time{font-size:11px;color:var(--text2)}
-  .wa-unread{background:var(--accent);color:#000;font-size:10px;font-weight:700;width:18px;height:18px;border-radius:50%;display:flex;align-items:center;justify-content:center}
-  .wa-window{flex:1;display:flex;flex-direction:column}
-  .wa-header{padding:12px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px;background:var(--bg2)}
-  .wa-messages{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:10px;background:var(--bg)}
-  .wa-msg-row{display:flex}.wa-msg-row.them{justify-content:flex-start}.wa-msg-row.us{justify-content:flex-end}
-  .wa-bubble{max-width:65%;padding:10px 14px;border-radius:16px;font-size:13px;line-height:1.5}
-  .wa-bubble.them{background:var(--bg2);border:1px solid var(--border);border-radius:4px 16px 16px 16px}
-  .wa-bubble.us{background:#00d9a330;border:1px solid #00d9a350;border-radius:16px 4px 16px 16px}
-  .wa-bubble-time{font-size:10px;color:var(--text2);margin-top:4px;text-align:right}
-  .intent-tag{display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:20px;font-size:10px;font-weight:700;letter-spacing:.5px;margin-top:6px}
-  .wa-input-bar{padding:14px 20px;border-top:1px solid var(--border);display:flex;gap:10px;background:var(--bg2)}
-  .wa-input{flex:1;border-radius:20px;padding:10px 16px;font-size:13px}.wa-input:focus{border-color:var(--accent)}
-  .wa-empty{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;color:var(--text2)}
-  .tabs{display:flex;gap:4px;background:var(--bg3);padding:4px;border-radius:var(--r2);width:fit-content}
-  .tab{padding:7px 16px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;color:var(--text2);transition:all .15s}
-  .tab.active{background:var(--bg2);color:var(--text);box-shadow:0 1px 3px #0006}
-  .section-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
-  .section-title{font-family:var(--fh);font-weight:700;font-size:15px}
-  .upload-zone{border:2px dashed var(--border);border-radius:var(--r);padding:32px;text-align:center;color:var(--text2);cursor:pointer;transition:all .2s}
-  .upload-zone:hover{border-color:var(--accent);color:var(--text);background:#00d9a308}
-  .form-group{margin-bottom:14px}
-  .form-label{font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--text2);font-weight:600;margin-bottom:6px;display:block}
-  select.form-input{cursor:pointer}
-  .spark{display:flex;align-items:flex-end;gap:2px;height:32px}
-  .spark-bar{width:6px;border-radius:2px;background:var(--accent);opacity:.6}
-  .mt-4{margin-top:16px}.mt-6{margin-top:24px}.mb-4{margin-bottom:16px}.mb-2{margin-bottom:8px}
-  .w-full{width:100%}
-  .av-1{background:linear-gradient(135deg,#667eea,#764ba2)}.av-2{background:linear-gradient(135deg,#f093fb,#f5576c)}
-  .av-3{background:linear-gradient(135deg,#4facfe,#00f2fe)}.av-4{background:linear-gradient(135deg,#43e97b,#38f9d7)}
-  .av-5{background:linear-gradient(135deg,#fa709a,#fee140)}.av-6{background:linear-gradient(135deg,#a18cd1,#fbc2eb)}
-  .av-7{background:linear-gradient(135deg,#fd746c,#ff9068)}.av-8{background:linear-gradient(135deg,#30cfd0,#330867)}
-
-  /* SEGMENTS */
-  .seg-kanban{display:flex;gap:16px;overflow-x:auto;padding-bottom:8px;height:calc(100vh - 210px);align-items:flex-start}
-  .seg-col{min-width:230px;max-width:230px;display:flex;flex-direction:column;background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);overflow:hidden;max-height:100%}
-  .seg-col-header{padding:12px 14px;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--border);flex-shrink:0}
-  .seg-col-title{font-weight:700;font-size:13px;flex:1}
-  .seg-col-count{font-size:11px;color:var(--text2);background:var(--bg3);padding:2px 7px;border-radius:10px}
-  .seg-col-body{flex:1;overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:8px}
-  .seg-cust-card{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r2);padding:10px 12px;cursor:grab;transition:all .15s}
-  .seg-cust-card:hover{border-color:var(--accent);transform:translateY(-1px)}
-  .seg-cust-card.dragging{opacity:.4}
-  .seg-drop-zone{border:2px dashed var(--border);border-radius:var(--r2);padding:20px;text-align:center;font-size:12px;color:var(--text2);transition:all .15s}
-  .seg-drop-zone.over{border-color:var(--accent);background:#00d9a308;color:var(--accent)}
-  .seg-rule-row{display:flex;align-items:center;gap:8px;padding:8px;background:var(--bg3);border-radius:var(--r2);border:1px solid var(--border);margin-bottom:8px}
-  .seg-rule-row select,.seg-rule-row input[type=number]{background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text);font-size:12px;outline:none;font-family:var(--fb)}
-  .seg-rule-row select:focus,.seg-rule-row input:focus{border-color:var(--accent)}
-  .ai-rec-card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:18px;position:relative;overflow:hidden;transition:border-color .2s}
-  .ai-rec-card:hover{border-color:#7c4dff66}
-  .ai-rec-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,#7c4dff,#a855f7)}
-  .ai-rec-badge{display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:20px;font-size:10px;font-weight:700;background:#7c4dff22;color:#a78bfa;margin-bottom:10px}
-  .conf-bar{height:3px;border-radius:2px;background:var(--border);overflow:hidden;margin-top:6px}
-  .conf-fill{height:100%;border-radius:2px;background:linear-gradient(90deg,#7c4dff,#a855f7);transition:width .8s}
-  .seg-modal-overlay{position:fixed;inset:0;background:#000b;z-index:100;display:flex;align-items:center;justify-content:center}
-  .seg-modal{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);width:540px;max-height:85vh;overflow-y:auto}
-  .seg-modal-head{padding:20px 24px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
-  .seg-modal-body{padding:20px 24px}
-  .seg-modal-foot{padding:16px 24px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:10px}
-  .seg-color-swatch{width:26px;height:26px;border-radius:50%;cursor:pointer;border:2px solid transparent;transition:all .15s;flex-shrink:0}
-  .seg-color-swatch.sel{border-color:white;transform:scale(1.2)}
-  @keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
-  .fade-in{animation:fadeIn .2s ease forwards}
-  .checkbox{width:15px;height:15px;cursor:pointer;accent-color:var(--accent)}
-  .connect-title{font-family:var(--fh);font-weight:700;font-size:16px;margin-bottom:6px}
-  .connect-desc{font-size:13px;color:var(--text2);line-height:1.6;margin-bottom:16px}
-  .connect-icon{width:48px;height:48px;border-radius:var(--r2);display:flex;align-items:center;justify-content:center;margin-bottom:14px;font-size:22px}
-  .connect-status{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;margin-bottom:16px}
-  .dot{width:8px;height:8px;border-radius:50%}.dot-g{background:var(--accent)}.dot-grey{background:var(--text2)}
-`;
-
-// ─── MICRO COMPONENTS ────────────────────────────────────────────────────────
-const SparkLine = ({values}) => {
-  const max = Math.max(...values);
-  return <div className="spark">{values.map((v,i)=><div key={i} className="spark-bar" style={{height:`${(v/max)*100}%`}}/>)}</div>;
-};
-const ChurnBar = ({risk}) => {
-  const c = risk>70?"#ff4d6d":risk>40?"#f59e0b":"#00d9a3";
-  return <div style={{display:"flex",alignItems:"center",gap:8}}>
-    <div className="churn-bar"><div className="churn-fill" style={{width:`${risk}%`,background:c}}/></div>
-    <span style={{fontSize:12,color:c}}>{risk}%</span>
-  </div>;
-};
-const IntentTag = ({intent}) => {
-  const cfg = INTENT_CONFIG[intent]; if(!cfg) return null;
-  return <div className="intent-tag" style={{background:cfg.bg,color:cfg.color}}>⚡ {cfg.label}</div>;
-};
-const SegBadge = ({name,color}) => (
-  <span style={{background:color+"22",color,padding:"3px 9px",borderRadius:20,fontSize:11,fontWeight:600,display:"inline-block"}}>{name}</span>
-);
-
-// ─── SEGMENT MODAL ───────────────────────────────────────────────────────────
-function SegmentModal({segment, customers, onSave, onClose}) {
-  const isNew = !segment;
-  const [name,  setName]  = useState(segment?.name || "");
-  const [desc,  setDesc]  = useState(segment?.description || "");
-  const [color, setColor] = useState(segment?.color || PALETTE[0]);
-  const [icon,  setIcon]  = useState(segment?.icon || "🏷️");
-  const [type,  setType]  = useState(segment?.type || "rule");
-  const [rules, setRules] = useState(segment?.rules?.length ? segment.rules : [{field:"revenue",op:"gte",value:""}]);
-  const [manIds,setManIds]= useState(new Set(segment?.customerIds || []));
-
-  const addRule    = ()     => setRules(r => [...r, {field:"revenue",op:"gte",value:""}]);
-  const removeRule = i      => setRules(r => r.filter((_,j)=>j!==i));
-  const updateRule = (i,k,v)=> setRules(r => r.map((row,j)=>j===i?{...row,[k]:v}:row));
-
-  const matched = type==="rule"
-    ? customers.filter(c => matchRules(c, rules.filter(r=>r.value!=="")))
-    : customers.filter(c => manIds.has(c.id));
-
-  const toggle = id => setManIds(s=>{ const n=new Set(s); n.has(id)?n.delete(id):n.add(id); return n; });
-
-  const ICONS = ["🏷️","👑","💚","⭐","⚠️","💔","🚀","🎯","🐋","🔥","💎","🌱","🏆","🎪","🌟"];
-
-  const save = () => {
-    if(!name.trim()) return;
-    onSave({
-      id: segment?.id || `seg-${Date.now()}`,
-      name, description:desc, color, icon, type,
-      rules: type==="rule" ? rules.filter(r=>r.value!=="") : [],
-      customerIds: type==="rule" ? matched.map(c=>c.id) : [...manIds],
-      aiGenerated: false,
-      createdAt: segment?.createdAt || new Date().toISOString().slice(0,10),
-    });
-  };
-
-  return (
-    <div className="seg-modal-overlay" onClick={e=>e.target===e.currentTarget&&onClose()}>
-      <div className="seg-modal fade-in">
-        <div className="seg-modal-head">
-          <div style={{fontFamily:"var(--fh)",fontWeight:700,fontSize:16}}>{isNew?"Create Segment":"Edit Segment"}</div>
-          <button className="btn btn-ghost btn-sm" onClick={onClose}>✕</button>
-        </div>
-        <div className="seg-modal-body">
-          <div className="form-group">
-            <label className="form-label">Segment Name</label>
-            <input className="form-input" value={name} onChange={e=>setName(e.target.value)} placeholder="e.g. VIP, Win-Back, High Potential..." />
-          </div>
-          <div className="form-group">
-            <label className="form-label">Description</label>
-            <input className="form-input" value={desc} onChange={e=>setDesc(e.target.value)} placeholder="Short description of this segment..." />
-          </div>
-          <div className="form-group">
-            <label className="form-label">Icon</label>
-            <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
-              {ICONS.map(ic=>(
-                <button key={ic} onClick={()=>setIcon(ic)} style={{fontSize:18,padding:"4px 8px",borderRadius:6,cursor:"pointer",border:`2px solid ${icon===ic?"var(--accent)":"var(--border)"}`,background:"var(--bg3)"}}>
-                  {ic}
-                </button>
-              ))}
-            </div>
-          </div>
-          <div className="form-group">
-            <label className="form-label">Color</label>
-            <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-              {PALETTE.map(c=>(
-                <div key={c} className={`seg-color-swatch ${color===c?"sel":""}`} style={{background:c}} onClick={()=>setColor(c)}/>
-              ))}
-            </div>
-          </div>
-          <div className="form-group">
-            <label className="form-label">Segment Type</label>
-            <div className="tabs mb-2">
-              <div className={`tab ${type==="rule"?"active":""}`} onClick={()=>setType("rule")}>Rule-Based (Auto)</div>
-              <div className={`tab ${type==="manual"?"active":""}`} onClick={()=>setType("manual")}>Manual (Pick)</div>
-            </div>
-          </div>
-
-          {type==="rule" && (
-            <div>
-              <label className="form-label">Rules — all conditions must match</label>
-              {rules.map((rule,i)=>(
-                <div key={i} className="seg-rule-row">
-                  <select value={rule.field} onChange={e=>updateRule(i,"field",e.target.value)}>
-                    {RULE_FIELDS.map(f=><option key={f.key} value={f.key}>{f.label}</option>)}
-                  </select>
-                  <select value={rule.op} onChange={e=>updateRule(i,"op",e.target.value)}>
-                    {RULE_OPS.map(o=><option key={o.key} value={o.key}>{o.label}</option>)}
-                  </select>
-                  <input type="number" value={rule.value} onChange={e=>updateRule(i,"value",e.target.value)} placeholder="value" style={{width:80}}/>
-                  {rules.length>1&&<button onClick={()=>removeRule(i)} style={{background:"none",border:"none",color:"var(--danger)",cursor:"pointer",fontSize:18,lineHeight:1}}>×</button>}
-                </div>
-              ))}
-              <button className="btn btn-ghost btn-sm" onClick={addRule}>+ Add Condition</button>
-              {matched.length>0 && (
-                <div style={{marginTop:12,padding:"10px 12px",background:"var(--bg3)",borderRadius:"var(--r2)",fontSize:12}}>
-                  <span style={{color:"var(--accent)",fontWeight:700}}>{matched.length} customer{matched.length!==1?"s":""}</span>
-                  <span style={{color:"var(--text2)"}}> match: </span>
-                  {matched.map(c=><span key={c.id} style={{marginRight:6}}>{c.name}</span>)}
-                </div>
-              )}
-              {matched.length===0 && rules.some(r=>r.value!=="") && (
-                <div style={{marginTop:12,padding:"10px 12px",background:"#ff4d6d0a",borderRadius:"var(--r2)",fontSize:12,color:"var(--danger)"}}>
-                  No customers match these rules yet.
-                </div>
-              )}
-            </div>
-          )}
-
-          {type==="manual" && (
-            <div>
-              <label className="form-label">Pick Customers</label>
-              <div style={{border:"1px solid var(--border)",borderRadius:"var(--r2)",overflow:"hidden",maxHeight:260,overflowY:"auto"}}>
-                {customers.map((c,i)=>(
-                  <div key={c.id} onClick={()=>toggle(c.id)}
-                    style={{display:"flex",alignItems:"center",gap:10,padding:"9px 12px",cursor:"pointer",
-                      background:manIds.has(c.id)?"#00d9a308":"transparent",
-                      borderBottom:"1px solid var(--border)"}}>
-                    <input type="checkbox" className="checkbox" checked={manIds.has(c.id)} onChange={()=>{}}/>
-                    <div className={`wa-avatar ${getAV(i)}`} style={{width:28,height:28,fontSize:10,borderRadius:"50%"}}>{c.name.split(' ').map(n=>n[0]).join('')}</div>
-                    <div style={{flex:1}}>
-                      <div style={{fontWeight:600,fontSize:13}}>{c.name}</div>
-                      <div style={{fontSize:11,color:"var(--text2)"}}>RM {c.revenue.toLocaleString()} · {c.orders} orders</div>
-                    </div>
-                    {manIds.has(c.id)&&<span style={{color:"var(--accent)"}}>✓</span>}
-                  </div>
-                ))}
-              </div>
-              <div style={{marginTop:8,fontSize:12,color:"var(--text2)"}}>{manIds.size} selected</div>
-            </div>
-          )}
-
-          <div style={{marginTop:16,padding:"10px 14px",background:"var(--bg3)",borderRadius:"var(--r2)",display:"flex",alignItems:"center",gap:10}}>
-            <span style={{fontSize:18}}>{icon}</span>
-            <div>
-              <div style={{fontSize:11,color:"var(--text2)",marginBottom:3}}>Preview</div>
-              <SegBadge name={name||"Segment Name"} color={color}/>
-            </div>
-          </div>
-        </div>
-        <div className="seg-modal-foot">
-          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
-          <button className="btn btn-primary" onClick={save} disabled={!name.trim()}>{isNew?"Create Segment":"Save Changes"}</button>
-        </div>
-      </div>
-    </div>
-  );
+INTENTS = {
+    "NEW_ORDER": {
+        "keywords": ["order", "i want", "i need", "can i get", "please send", "buy", "purchase",
+                     "add to order", "place order", "new order", "want to order", "like to order"],
+        "emoji": "🛒",
+        "label": "New Order",
+    },
+    "AMEND_ORDER": {
+        "keywords": ["change", "amend", "modify", "update", "edit", "instead", "replace",
+                     "add more", "reduce", "increase", "decrease", "adjust", "correction"],
+        "emoji": "✏️",
+        "label": "Amend Order",
+    },
+    "CANCEL_ORDER": {
+        "keywords": ["cancel", "cancellation", "don't want", "dont want", "remove", "delete order",
+                     "stop order", "no longer need", "nevermind", "never mind", "call off"],
+        "emoji": "❌",
+        "label": "Cancel Order",
+    },
+    "ENQUIRY": {
+        "keywords": ["price", "how much", "available", "availability", "stock", "when", "delivery",
+                     "what is", "do you have", "tell me", "info", "information", "details", "?"],
+        "emoji": "💬",
+        "label": "Enquiry",
+    },
+    "ORDER_STATUS": {
+        "keywords": ["status", "where is", "my order", "tracking", "delivered", "when will",
+                     "update on", "check order", "order number"],
+        "emoji": "📦",
+        "label": "Order Status",
+    },
+    "GREETING": {
+        "keywords": ["hi", "hello", "hey", "good morning", "good afternoon", "good evening",
+                     "morning", "afternoon", "evening", "howdy", "sup"],
+        "emoji": "👋",
+        "label": "Greeting",
+    },
 }
 
-// ─── SEGMENTS SCREEN ─────────────────────────────────────────────────────────
-function SegmentsScreen({customers, setCustomers}) {
-  const [segments,   setSegments]   = useState(INITIAL_SEGMENTS);
-  const [view,       setView]       = useState("board");
-  const [showModal,  setShowModal]  = useState(false);
-  const [editSeg,    setEditSeg]    = useState(null);
-  const [aiRecs,     setAiRecs]     = useState(AI_RECS);
-  const [aiRunning,  setAiRunning]  = useState(false);
-  const [aiDone,     setAiDone]     = useState(false);
-  const [dragCust,   setDragCust]   = useState(null);
-  const [dragOver,   setDragOver]   = useState(null);
-  const [filterSeg,  setFilterSeg]  = useState(null);
+def detect_intent_rules(text: str) -> Tuple[str, float]:
+    """Rule-based intent detection. Returns (intent, confidence 0-1)."""
+    text_lower = text.lower()
+    scores = {}
+    for intent, config in INTENTS.items():
+        matches = sum(1 for kw in config["keywords"] if kw in text_lower)
+        if matches > 0:
+            scores[intent] = matches / len(config["keywords"])
 
-  const runAI = () => { setAiRunning(true); setTimeout(()=>{setAiRunning(false);setAiDone(true);},2000); };
+    if not scores:
+        return "UNKNOWN", 0.0
 
-  const acceptRec = rec => {
-    setSegments(s=>[...s,{...rec,aiGenerated:true}]);
-    setCustomers(cs=>cs.map(c=>rec.customerIds.includes(c.id)?{...c,segment:rec.name}:c));
-    setAiRecs(r=>r.filter(x=>x.id!==rec.id));
-  };
+    best = max(scores, key=scores.get)
+    # Normalize confidence
+    confidence = min(scores[best] * 10, 1.0)
+    return best, confidence
 
-  const saveSeg = seg => {
-    setSegments(s=>{
-      const exists=s.find(x=>x.id===seg.id);
-      return exists ? s.map(x=>x.id===seg.id?seg:x) : [...s,seg];
-    });
-    setCustomers(cs=>cs.map(c=>seg.customerIds.includes(c.id)?{...c,segment:seg.name}:c));
-    setShowModal(false); setEditSeg(null);
-  };
+def extract_order_items(text: str) -> List[Dict]:
+    """
+    Extract product names and quantities from natural language.
+    e.g. "I want 3 boxes of chicken karaage and 10 pcs mushroom"
+    → [{"name": "chicken karaage", "qty": 3, "uom": "boxes"}, ...]
+    """
+    items = []
+    # Pattern: number + optional unit + product name
+    patterns = [
+        r'(\d+)\s*(boxes?|pcs?|packets?|pkts?|kgs?|units?|packs?|cartons?|bags?|bottles?|cans?)?\s+(?:of\s+)?([a-zA-Z][a-zA-Z\s\-]{2,40}?)(?:\s+and|\s*,|\s*$)',
+        r'([a-zA-Z][a-zA-Z\s\-]{2,40}?)\s*[x×]\s*(\d+)',
+    ]
 
-  const deleteSeg = id => {
-    if(!confirm("Delete this segment?")) return;
-    setSegments(s=>s.filter(x=>x.id!==id));
-  };
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            groups = match.groups()
+            if len(groups) == 3:
+                qty, uom, name = groups
+                items.append({"name": name.strip(), "qty": int(qty), "uom": uom or "unit"})
+            elif len(groups) == 2:
+                name, qty = groups
+                items.append({"name": name.strip(), "qty": int(qty), "uom": "unit"})
 
-  const drop = segId => {
-    if(!dragCust) return;
-    const seg = segments.find(s=>s.id===segId); if(!seg) return;
-    setSegments(segs=>segs.map(s=>
-      s.id===segId
-        ? {...s, customerIds:[...new Set([...s.customerIds,dragCust.id])]}
-        : {...s, customerIds:s.customerIds.filter(id=>id!==dragCust.id)}
-    ));
-    setCustomers(cs=>cs.map(c=>c.id===dragCust.id?{...c,segment:seg.name}:c));
-    setDragCust(null); setDragOver(null);
-  };
+    return items
 
-  const filteredCustomers = filterSeg
-    ? customers.filter(c=>{ const s=segments.find(x=>x.id===filterSeg); return s?.customerIds.includes(c.id); })
-    : customers;
+def extract_order_number(text: str) -> Optional[str]:
+    """Extract order number like B2B-22082025-003 from text."""
+    pattern = r'[A-Z]{2,5}[-/]\d{6,12}[-/]\d{1,5}'
+    match = re.search(pattern, text.upper())
+    return match.group(0) if match else None
 
-  return (
-    <div style={{display:"flex",flexDirection:"column",height:"calc(100vh - 52px)",overflow:"hidden"}}>
-      {/* Toolbar */}
-      <div style={{padding:"14px 24px",borderBottom:"1px solid var(--border)",display:"flex",alignItems:"center",gap:12,background:"var(--bg2)",flexShrink:0}}>
-        <div className="tabs">
-          <div className={`tab ${view==="board"?"active":""}`} onClick={()=>setView("board")}>🗂 Board</div>
-          <div className={`tab ${view==="list"?"active":""}`}  onClick={()=>setView("list")}>📋 List</div>
-          <div className={`tab ${view==="ai"?"active":""}`}    onClick={()=>setView("ai")}>✦ AI Recommendations {aiRecs.length>0&&<span style={{marginLeft:4,background:"#7c4dff",color:"white",fontSize:9,fontWeight:700,padding:"1px 5px",borderRadius:10}}>{aiRecs.length}</span>}</div>
-        </div>
-        <div style={{marginLeft:"auto",display:"flex",gap:10}}>
-          {view==="ai"&&!aiDone&&<button className="btn btn-ai" onClick={runAI} disabled={aiRunning}>{aiRunning?<><span>✦</span> Analysing...</>:"✦ Run AI Analysis"}</button>}
-          <button className="btn btn-primary" onClick={()=>{setEditSeg(null);setShowModal(true);}}>+ New Segment</button>
-        </div>
-      </div>
+# ─── Claude AI Intent Analysis ────────────────────────────────────────────────
 
-      {/* BOARD */}
-      {view==="board" && (
-        <div style={{padding:"20px 24px",overflowX:"auto",flex:1,overflowY:"hidden"}}>
-          <div className="seg-kanban">
-            {segments.map(seg=>{
-              const sc = customers.filter(c=>seg.customerIds.includes(c.id));
-              const rev = sc.reduce((a,c)=>a+c.revenue,0);
-              return (
-                <div key={seg.id} className="seg-col"
-                  style={{borderTop:`3px solid ${seg.color}`,boxShadow:dragOver===seg.id?`0 0 0 2px ${seg.color}`:"none"}}
-                  onDragOver={e=>{e.preventDefault();setDragOver(seg.id);}}
-                  onDrop={()=>drop(seg.id)}
-                  onDragLeave={()=>setDragOver(null)}>
-                  <div className="seg-col-header">
-                    <span style={{fontSize:16}}>{seg.icon}</span>
-                    <div className="seg-col-title" style={{color:seg.color}}>{seg.name}</div>
-                    <div className="seg-col-count">{sc.length}</div>
-                    <button className="btn btn-ghost btn-sm" style={{padding:"3px 7px"}} onClick={()=>{setEditSeg(seg);setShowModal(true);}}>✏</button>
-                    <button className="btn btn-danger btn-sm" style={{padding:"3px 7px"}} onClick={()=>deleteSeg(seg.id)}>🗑</button>
-                  </div>
-                  <div style={{padding:"6px 12px 6px",borderBottom:"1px solid var(--border)",fontSize:11,color:"var(--text2)",flexShrink:0,display:"flex",justifyContent:"space-between"}}>
-                    <span>RM {rev.toLocaleString()}</span>
-                    {seg.aiGenerated&&<span style={{color:"#a78bfa",fontWeight:700}}>✦ AI</span>}
-                    {seg.type==="rule"&&<span style={{color:"var(--text2)"}}>auto</span>}
-                  </div>
-                  <div className="seg-col-body">
-                    {sc.map((c,i)=>(
-                      <div key={c.id} className={`seg-cust-card${dragCust?.id===c.id?" dragging":""}`}
-                        draggable onDragStart={()=>setDragCust(c)} onDragEnd={()=>setDragCust(null)}>
-                        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
-                          <div className={`wa-avatar ${getAV(i)}`} style={{width:24,height:24,fontSize:9,borderRadius:"50%",flexShrink:0}}>{c.name.split(' ').map(n=>n[0]).join('')}</div>
-                          <div style={{fontWeight:600,fontSize:12,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{c.name}</div>
-                        </div>
-                        <div style={{fontSize:11,color:"var(--text2)",display:"flex",justifyContent:"space-between",marginBottom:4}}>
-                          <span>RM {c.revenue.toLocaleString()}</span><span>{c.orders} orders</span>
-                        </div>
-                        <ChurnBar risk={c.churnRisk}/>
-                      </div>
-                    ))}
-                    {sc.length===0&&(
-                      <div className={`seg-drop-zone${dragOver===seg.id?" over":""}`}>Drop customers here</div>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-          <div style={{marginTop:10,fontSize:12,color:"var(--text2)"}}>💡 Drag & drop customer cards between columns to reassign segments</div>
-        </div>
-      )}
+async def analyze_with_ai(
+    message_text: str,
+    sender_name: str,
+    customer_name: Optional[str],
+    recent_context: List[Dict],
+) -> Dict:
+    """
+    Use AI (Claude or OpenAI) to understand message intent.
+    Falls back to rule-based if no API key is set.
+    Priority: Anthropic > OpenAI > rule-based
+    """
+    anthropic_key = credentials["agent"].get("anthropic_key", "")
+    openai_key    = credentials["agent"].get("openai_key", "")
 
-      {/* LIST */}
-      {view==="list" && (
-        <div style={{padding:"20px 24px",flex:1,overflow:"auto"}}>
-          <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:16}}>
-            <button className={`btn btn-sm ${!filterSeg?"btn-primary":"btn-ghost"}`} onClick={()=>setFilterSeg(null)}>All ({customers.length})</button>
-            {segments.map(seg=>(
-              <button key={seg.id} className={`btn btn-sm ${filterSeg===seg.id?"btn-primary":"btn-ghost"}`}
-                onClick={()=>setFilterSeg(filterSeg===seg.id?null:seg.id)}
-                style={filterSeg===seg.id?{background:seg.color,color:"#000"}:{}}>
-                {seg.icon} {seg.name} ({customers.filter(c=>seg.customerIds.includes(c.id)).length})
-              </button>
-            ))}
-          </div>
-          <div className="card" style={{padding:0}}>
-            <table><thead><tr><th>Customer</th><th>Segment</th><th>Revenue</th><th>Orders</th><th>Churn Risk</th><th>Last Order</th><th>Change Segment</th></tr></thead>
-            <tbody>{filteredCustomers.map((c,i)=>{
-              const seg = segments.find(s=>s.customerIds.includes(c.id));
-              return (
-                <tr key={c.id}>
-                  <td><div style={{display:"flex",alignItems:"center",gap:8}}>
-                    <div className={`wa-avatar ${getAV(i)}`} style={{width:30,height:30,fontSize:10,borderRadius:"50%"}}>{c.name.split(' ').map(n=>n[0]).join('')}</div>
-                    <div><div style={{fontWeight:600}}>{c.name}</div><div style={{fontSize:11,color:"var(--text2)"}}>{c.phone}</div></div>
-                  </div></td>
-                  <td>{seg?<SegBadge name={`${seg.icon} ${seg.name}`} color={seg.color}/>:<span style={{color:"var(--text2)"}}>—</span>}</td>
-                  <td style={{fontWeight:600}}>RM {c.revenue.toLocaleString()}</td>
-                  <td>{c.orders}</td>
-                  <td><ChurnBar risk={c.churnRisk}/></td>
-                  <td style={{color:"var(--text2)"}}>{c.lastOrder}</td>
-                  <td>
-                    <select className="form-input" style={{width:150,padding:"5px 8px",fontSize:12}} value={seg?.id||""}
-                      onChange={e=>{
-                        const nid=e.target.value;
-                        setSegments(segs=>segs.map(s=>{
-                          if(s.id===nid) return {...s,customerIds:[...new Set([...s.customerIds,c.id])]};
-                          if(s.customerIds.includes(c.id)) return {...s,customerIds:s.customerIds.filter(id=>id!==c.id)};
-                          return s;
-                        }));
-                        const ns = segments.find(s=>s.id===nid);
-                        setCustomers(cs=>cs.map(x=>x.id===c.id?{...x,segment:ns?.name||x.segment}:x));
-                      }}>
-                      <option value="">— Unassigned —</option>
-                      {segments.map(s=><option key={s.id} value={s.id}>{s.icon} {s.name}</option>)}
-                    </select>
-                  </td>
-                </tr>
-              );
-            })}</tbody></table>
-          </div>
-        </div>
-      )}
-
-      {/* AI */}
-      {view==="ai" && (
-        <div style={{padding:"20px 24px",flex:1,overflow:"auto"}}>
-          {!aiDone&&!aiRunning&&(
-            <div style={{maxWidth:500,margin:"50px auto",textAlign:"center"}}>
-              <div style={{fontSize:52,marginBottom:16}}>✦</div>
-              <div style={{fontFamily:"var(--fh)",fontWeight:700,fontSize:22,marginBottom:12}}>AI Segment Intelligence</div>
-              <div style={{color:"var(--text2)",fontSize:14,lineHeight:1.8,marginBottom:24}}>
-                Analyse your customers using RFM scoring, churn probability signals, and LTV clustering to discover high-impact segments with actionable recommendations.
-              </div>
-              <button className="btn btn-ai" style={{fontSize:14,padding:"12px 32px",margin:"0 auto"}} onClick={runAI}>✦ Run AI Analysis</button>
-            </div>
-          )}
-
-          {aiRunning&&(
-            <div style={{maxWidth:420,margin:"60px auto",textAlign:"center"}}>
-              <div style={{fontSize:36,marginBottom:16}}>✦</div>
-              <div style={{fontFamily:"var(--fh)",fontWeight:700,fontSize:18,marginBottom:8}}>Analysing your {customers.length} customers…</div>
-              <div style={{color:"var(--text2)",fontSize:13,marginBottom:20}}>Calculating RFM scores, churn probability, LTV clustering…</div>
-              <div style={{height:4,background:"var(--border)",borderRadius:2,overflow:"hidden"}}>
-                <div style={{height:"100%",background:"linear-gradient(90deg,#7c4dff,#a855f7)",borderRadius:2,animation:"slideR 2s linear forwards"}}/>
-              </div>
-              <style>{`@keyframes slideR{from{width:0}to{width:100%}}`}</style>
-            </div>
-          )}
-
-          {aiDone&&(
-            <div>
-              <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:20}}>
-                <div style={{flex:1}}>
-                  <div style={{fontFamily:"var(--fh)",fontWeight:700,fontSize:16}}>✦ AI Segment Recommendations</div>
-                  <div style={{fontSize:13,color:"var(--text2)",marginTop:2}}>Based on RFM analysis across {customers.length} customers</div>
-                </div>
-                <button className="btn btn-ghost btn-sm" onClick={()=>{setAiDone(false);setAiRecs(AI_RECS);}}>↺ Re-run</button>
-              </div>
-
-              {aiRecs.length>0?(
-                <div className="grid-3">
-                  {aiRecs.map(rec=>(
-                    <div key={rec.id} className="ai-rec-card fade-in">
-                      <div className="ai-rec-badge">✦ AI Recommended</div>
-                      <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
-                        <span style={{fontSize:26}}>{rec.icon}</span>
-                        <div>
-                          <div style={{fontFamily:"var(--fh)",fontWeight:700,fontSize:15}}>{rec.name}</div>
-                          <SegBadge name={rec.name} color={rec.color}/>
-                        </div>
-                      </div>
-                      <div style={{fontSize:13,color:"var(--text2)",lineHeight:1.6,marginBottom:10}}>{rec.description}</div>
-                      <div style={{fontSize:12,background:"var(--bg3)",borderRadius:8,padding:"10px 12px",marginBottom:10,lineHeight:1.6}}>
-                        <div style={{color:"#a78bfa",fontWeight:700,fontSize:10,letterSpacing:1,textTransform:"uppercase",marginBottom:4}}>AI Reasoning</div>
-                        {rec.aiReason}
-                      </div>
-                      <div style={{fontSize:12,color:"var(--warn)",background:"#f59e0b12",borderRadius:8,padding:"8px 12px",marginBottom:12}}>
-                        💡 {rec.suggestedAction}
-                      </div>
-                      <div style={{marginBottom:12}}>
-                        <div style={{display:"flex",justifyContent:"space-between",fontSize:11,color:"var(--text2)",marginBottom:4}}>
-                          <span>AI Confidence</span><span style={{color:"#a78bfa",fontWeight:700}}>{rec.confidence}%</span>
-                        </div>
-                        <div className="conf-bar"><div className="conf-fill" style={{width:`${rec.confidence}%`}}/></div>
-                      </div>
-                      <div style={{fontSize:11,color:"var(--text2)",marginBottom:12}}>
-                        Affects: {customers.filter(c=>rec.customerIds.includes(c.id)).map(c=>c.name).join(", ")}
-                      </div>
-                      <div style={{display:"flex",gap:8}}>
-                        <button className="btn btn-ai btn-sm" style={{flex:1,justifyContent:"center"}} onClick={()=>acceptRec(rec)}>Accept & Apply</button>
-                        <button className="btn btn-ghost btn-sm" onClick={()=>setAiRecs(r=>r.filter(x=>x.id!==rec.id))}>Dismiss</button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              ):(
-                <div style={{textAlign:"center",padding:"40px",color:"var(--text2)",background:"var(--bg2)",borderRadius:"var(--r)",border:"1px solid var(--border)"}}>
-                  All recommendations applied or dismissed! <button className="btn btn-ghost btn-sm" style={{marginLeft:12}} onClick={()=>{setAiDone(false);setAiRecs(AI_RECS);}}>Reset</button>
-                </div>
-              )}
-
-              <div className="card mt-6">
-                <div className="section-head"><div className="section-title">Segment Distribution</div></div>
-                <div style={{display:"flex",gap:12,flexWrap:"wrap"}}>
-                  {segments.map(seg=>{
-                    const cnt = customers.filter(c=>seg.customerIds.includes(c.id)).length;
-                    const pct = Math.round((cnt/customers.length)*100);
-                    return (
-                      <div key={seg.id} style={{flex:"1 1 140px",background:"var(--bg3)",borderRadius:"var(--r2)",padding:"12px 14px",borderTop:`3px solid ${seg.color}`}}>
-                        <div style={{fontSize:18,marginBottom:4}}>{seg.icon}</div>
-                        <div style={{fontWeight:700,color:seg.color}}>{seg.name}</div>
-                        <div style={{fontSize:22,fontFamily:"var(--fh)",fontWeight:800}}>{cnt}</div>
-                        <div style={{fontSize:11,color:"var(--text2)"}}>{pct}% of base</div>
-                        {seg.aiGenerated&&<div style={{fontSize:10,color:"#a78bfa",marginTop:4}}>✦ AI</div>}
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-
-      {showModal&&<SegmentModal segment={editSeg} customers={customers} onSave={saveSeg} onClose={()=>{setShowModal(false);setEditSeg(null);}}/>}
-    </div>
-  );
-}
-
-// ─── OTHER SCREENS ────────────────────────────────────────────────────────────
-function DashboardScreen({customers}) {
-  const totalRev   = customers.reduce((a,c)=>a+c.revenue,0);
-  const totalOrds  = customers.reduce((a,c)=>a+c.orders,0);
-  const atRisk     = customers.filter(c=>c.churnRisk>60).length;
-  return (
-    <div className="content">
-      <div className="grid-4 mb-4">
-        {[
-          {label:"Total Revenue",  value:`RM ${totalRev.toLocaleString()}`, change:"+18.4%", up:true,  spark:[40,55,45,70,60,80,75,95]},
-          {label:"Customers",      value:customers.length,                  change:"+3 this month", up:true, spark:[3,4,4,5,4,6,5,6]},
-          {label:"Total Orders",   value:totalOrds,                         change:"+12.1%", up:true, spark:[120,135,128,150,140,165,155,187]},
-          {label:"Churn Risk",     value:`${atRisk} customers`,             change:"needs attention", up:false, spark:[1,2,1,3,2,3,2,2]},
-        ].map((s,i)=>(
-          <div key={i} className="card" style={{padding:16}}>
-            <div className="stat-label">{s.label}</div>
-            <div className="stat-value">{s.value}</div>
-            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
-              <span style={{fontSize:12}} className={s.up?"up":"down"}>{s.up?"▲":"▼"} {s.change}</span>
-              <SparkLine values={s.spark}/>
-            </div>
-          </div>
-        ))}
-      </div>
-      <div className="grid-2">
-        <div className="card">
-          <div className="section-head"><div className="section-title">Top Customers</div><span style={{fontSize:12,color:"var(--text2)"}}>by revenue</span></div>
-          <table><thead><tr><th>Customer</th><th>Revenue</th><th>Segment</th></tr></thead>
-          <tbody>{[...customers].sort((a,b)=>b.revenue-a.revenue).slice(0,5).map((c,i)=>(
-            <tr key={c.id}><td><div style={{display:"flex",alignItems:"center",gap:8}}>
-              <div className={`wa-avatar ${getAV(i)}`} style={{width:28,height:28,fontSize:10,borderRadius:"50%"}}>{c.name.split(' ').map(n=>n[0]).join('')}</div>{c.name}
-            </div></td><td>RM {c.revenue.toLocaleString()}</td>
-            <td><span className={`badge badge-${c.segment.toLowerCase().replace(/ /g,"-")}`}>{c.segment}</span></td></tr>
-          ))}</tbody></table>
-        </div>
-        <div className="card">
-          <div className="section-head"><div className="section-title">Products</div><span style={{fontSize:12,color:"var(--text2)"}}>by revenue</span></div>
-          <table><thead><tr><th>Product</th><th>Revenue</th><th>Growth</th></tr></thead>
-          <tbody>{[...MOCK_PRODUCTS].sort((a,b)=>b.revenue-a.revenue).map(p=>(
-            <tr key={p.id}><td><div style={{fontWeight:600}}>{p.name}</div><div style={{fontSize:11,color:"var(--text2)"}}>{p.sku}</div></td>
-            <td>RM {p.revenue.toLocaleString()}</td><td><span className={p.growth>0?"up":"down"}>{p.growth>0?"▲":"▼"} {Math.abs(p.growth)}%</span></td></tr>
-          ))}</tbody></table>
-        </div>
-      </div>
-      <div className="mt-4 card">
-        <div className="section-head"><div className="section-title">⚠️ Churn Risk Watch</div></div>
-        <table><thead><tr><th>Customer</th><th>Last Order</th><th>Orders</th><th>Churn Risk</th><th>Segment</th><th></th></tr></thead>
-        <tbody>{[...customers].sort((a,b)=>b.churnRisk-a.churnRisk).map((c,i)=>(
-          <tr key={c.id}><td><div style={{display:"flex",alignItems:"center",gap:8}}>
-            <div className={`wa-avatar ${getAV(i)}`} style={{width:28,height:28,fontSize:10,borderRadius:"50%"}}>{c.name.split(' ').map(n=>n[0]).join('')}</div>
-            <div><div style={{fontWeight:600}}>{c.name}</div><div style={{fontSize:11,color:"var(--text2)"}}>{c.phone}</div></div>
-          </div></td><td style={{color:"var(--text2)"}}>{c.lastOrder}</td><td>{c.orders}</td>
-          <td><ChurnBar risk={c.churnRisk}/></td>
-          <td><span className={`badge badge-${c.segment.toLowerCase().replace(/ /g,"-")}`}>{c.segment}</span></td>
-          <td><button className="btn btn-ghost btn-sm">Re-engage</button></td></tr>
-        ))}</tbody></table>
-      </div>
-    </div>
-  );
-}
-
-function CustomersScreen({customers}) {
-  const [q,setQ] = useState("");
-  const filtered = customers.filter(c=>c.name.toLowerCase().includes(q.toLowerCase())||c.phone.includes(q));
-  return (
-    <div className="content">
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16}}>
-        <input className="search-input" placeholder="Search..." value={q} onChange={e=>setQ(e.target.value)}/>
-        <button className="btn btn-primary">＋ Add Customer</button>
-      </div>
-      <div className="card" style={{padding:0}}>
-        <table><thead><tr><th>Customer</th><th>Phone</th><th>Orders</th><th>Revenue</th><th>Churn Risk</th><th>Segment</th></tr></thead>
-        <tbody>{filtered.map((c,i)=>(
-          <tr key={c.id}><td><div style={{display:"flex",alignItems:"center",gap:8}}>
-            <div className={`wa-avatar ${getAV(i)}`} style={{width:30,height:30,fontSize:10,borderRadius:"50%"}}>{c.name.split(' ').map(n=>n[0]).join('')}</div>
-            <span style={{fontWeight:600}}>{c.name}</span>
-          </div></td><td style={{color:"var(--text2)"}}>{c.phone}</td><td>{c.orders}</td>
-          <td style={{fontWeight:600}}>RM {c.revenue.toLocaleString()}</td>
-          <td><ChurnBar risk={c.churnRisk}/></td>
-          <td><span className={`badge badge-${c.segment.toLowerCase().replace(/ /g,"-")}`}>{c.segment}</span></td></tr>
-        ))}</tbody></table>
-      </div>
-    </div>
-  );
-}
-
-function ProductsScreen() {
-  return (
-    <div className="content">
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16}}>
-        <div style={{fontFamily:"var(--fh)",fontWeight:700,fontSize:15}}>Product Performance</div>
-        <button className="btn btn-primary">＋ Add Product</button>
-      </div>
-      <div className="card" style={{padding:0}}>
-        <table><thead><tr><th>Product</th><th>SKU</th><th>Units Sold</th><th>Revenue</th><th>Growth</th></tr></thead>
-        <tbody>{[...MOCK_PRODUCTS].sort((a,b)=>b.revenue-a.revenue).map(p=>(
-          <tr key={p.id}><td style={{fontWeight:600}}>{p.name}</td><td style={{color:"var(--text2)",fontFamily:"monospace",fontSize:12}}>{p.sku}</td>
-          <td>{p.sold.toLocaleString()}</td><td style={{fontWeight:600}}>RM {p.revenue.toLocaleString()}</td>
-          <td><span className={p.growth>0?"up":"down"}>{p.growth>0?"▲":"▼"} {Math.abs(p.growth)}%</span></td></tr>
-        ))}</tbody></table>
-      </div>
-    </div>
-  );
-}
-
-const AI_RESP = {
-  "best customer":"Based on your data, **Jenny Tan** is your top customer at RM 24,000 revenue. Ahmad Razali is close behind at RM 18,450.",
-  "best product":"**Enterprise Suite** leads with RM 63,000 revenue and 41% growth. Premium Bundle follows at RM 48,000.",
-  "churn":"⚠️ **2 customers** are at critical risk: Priya Krishnan (88%) and Siti Noor (72%). Recommend a WhatsApp re-engagement today.",
-  "segment":"You have 5 active segments. The AI has identified 3 new high-value segments — check the Segments → AI Recommendations tab!",
-  "revenue":"Total revenue is **RM 76,450** across your customer base, up 18.4% vs last period.",
-};
-
-function AIInsightsScreen() {
-  const [msgs, setMsgs] = useState([{role:"ai",text:"Hi! Ask me anything about customers, products, or segments. Try: *'Who might churn?'* or *'Show segment insights'*"}]);
-  const [inp, setInp] = useState("");
-  const [typing, setTyping] = useState(false);
-  const ref = useRef(null);
-  useEffect(()=>{ref.current?.scrollIntoView({behavior:"smooth"});},[msgs]);
-  const send = () => {
-    if(!inp.trim()) return;
-    const q=inp.trim(); setMsgs(m=>[...m,{role:"user",text:q}]); setInp(""); setTyping(true);
-    setTimeout(()=>{
-      const lower=q.toLowerCase();
-      let reply="I've analysed your CRM data. Would you like specific insights on customers, segments, or products?";
-      for(const [k,v] of Object.entries(AI_RESP)) if(lower.includes(k)){reply=v;break;}
-      setTyping(false); setMsgs(m=>[...m,{role:"ai",text:reply}]);
-    },1200);
-  };
-  return (
-    <div style={{display:"flex",height:"calc(100vh - 52px)",overflow:"hidden"}}>
-      <div style={{flex:1,display:"flex",flexDirection:"column"}}>
-        <div className="ai-messages" style={{flex:1}}>
-          {msgs.map((m,i)=><div key={i} className={`ai-msg ${m.role}`} dangerouslySetInnerHTML={{__html:m.text.replace(/\*\*(.*?)\*\*/g,"<strong>$1</strong>").replace(/\*(.*?)\*/g,"<em>$1</em>")}}/>)}
-          {typing&&<div className="ai-msg ai"><div className="ai-typing"><span/><span/><span/></div></div>}
-          <div ref={ref}/>
-        </div>
-        <div className="ai-input-row">
-          <input className="ai-input" placeholder="Ask anything..." value={inp} onChange={e=>setInp(e.target.value)} onKeyDown={e=>e.key==="Enter"&&send()}/>
-          <button className="btn btn-primary" onClick={send}>Send ↵</button>
-        </div>
-      </div>
-      <div style={{width:220,borderLeft:"1px solid var(--border)",padding:16,background:"var(--bg2)"}}>
-        <div style={{fontSize:11,textTransform:"uppercase",letterSpacing:1,color:"var(--text2)",fontWeight:600,marginBottom:12}}>Quick Ask</div>
-        {["Best customers?","Best products?","Who might churn?","Total revenue?","Segment insights"].map((q,i)=>(
-          <button key={i} className="btn btn-ghost" style={{display:"block",width:"100%",textAlign:"left",marginBottom:6,fontSize:11}} onClick={()=>setInp(q)}>{q}</button>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function WhatsAppScreen({ conn = {} }) {
-  const { wapiOk=false, wapiChannelId="", wapiToken="", wapiUrl="https://gate.whapi.cloud", wapiPhoneNumber="" } = conn;
-
-  const [chats, setChats]   = useState(MOCK_WA_CHATS);
-  const [active, setActive] = useState(MOCK_WA_CHATS[0]);
-  const [inp, setInp]       = useState("");
-  const [searchQ, setSearchQ] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [lastFetch, setLastFetch] = useState(null);
-  const [fetchErr, setFetchErr] = useState("");
-  const [sending, setSending] = useState(false);
-  const msgEndRef = useRef(null);
-
-  // ── Map raw Whapi objects to our internal format ──
-  const mapChat = c => ({
-    id:      c.id,
-    name:    c.name || c.id?.replace("@s.whatsapp.net","").replace("@g.us",""),
-    phone:   c.id?.replace("@s.whatsapp.net","").replace("@g.us",""),
-    avatar:  ((c.name||"?").split(" ").map(w=>w[0]).join("").slice(0,2)||"?").toUpperCase(),
-    lastMsg: c.last_message?.text?.body || c.last_message?.body || c.last_message?.caption || "",
-    time:    c.last_message?.timestamp
-               ? new Date(c.last_message.timestamp * 1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})
-               : "",
-    unread:  c.unread_count || 0,
-    online:  false,
-    messages:[],
-  });
-
-  const mapMsg = m => ({
-    id:   m.id,
-    from: m.from_me ? "us" : "them",
-    text: m.text?.body
-          || m.image?.caption
-          || m.video?.caption
-          || m.document?.caption
-          || (m.type==="audio"||m.type==="voice" ? "🎙️ Voice message" : null)
-          || (m.type==="image" ? "📷 Image" : null)
-          || (m.type==="video" ? "🎬 Video" : null)
-          || (m.type==="document" ? "📎 "+(m.document?.file_name||"Document") : null)
-          || "["+( m.type||"media")+"]",
-    time: m.timestamp ? new Date(m.timestamp*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}) : "",
-    intent: null,
-  });
-
-  // ── Whapi caller: tries direct → proxy → shows clear error ──
-  // Direct call works if browser and gate.whapi.cloud are reachable (no CORS issue on some setups).
-  // Proxy call goes via agentUrl/proxy/whapi/* which the agent must expose (see whapi_proxy_routes.py).
-  const agentUrl = conn.agentUrl || window.AGENT_URL || "http://158.140.133.82:8000";
-  const wapiHdr  = { Authorization: `Bearer ${wapiToken}`, Accept: "application/json", "Content-Type": "application/json" };
-  const proxyHdr = { "Content-Type": "application/json", "X-Whapi-Token": wapiToken, "X-Whapi-Url": wapiUrl };
-
-  // Try URL1 first, fall back to URL2
-  const fetchWithFallback = async (directUrl, proxyUrl, opts1 = {}, opts2 = {}) => {
-    // 1. Direct to Whapi
-    try {
-      const r = await fetch(directUrl, { ...opts1, signal: AbortSignal.timeout(8000) });
-      if (r.status === 401) throw new Error("401_UNAUTH");
-      if (r.ok) return r;
-    } catch(e) {
-      if (e.message === "401_UNAUTH") throw e;
-      // CORS or network — fall through to proxy
-    }
-    // 2. Via agent proxy
-    try {
-      const r = await fetch(proxyUrl, { ...opts2, signal: AbortSignal.timeout(8000) });
-      if (r.status === 401) throw new Error("401_UNAUTH");
-      if (r.status === 404) throw new Error("404_PROXY"); // proxy routes not installed yet
-      if (r.ok) return r;
-      throw new Error(`HTTP ${r.status}`);
-    } catch(e) {
-      if (e.message === "401_UNAUTH") throw new Error("Invalid Whapi token — re-check in WA Settings");
-      if (e.message === "404_PROXY")  throw new Error("Proxy not found — add whapi_proxy_routes.py to your agent");
-      throw new Error("Agent unreachable — is it running at " + agentUrl + "?");
-    }
-  };
-
-  const fetchChats = async () => {
-    if (!wapiOk || !wapiToken) return;
-    setLoading(true); setFetchErr("");
-    try {
-      const res = await fetchWithFallback(
-        `${wapiUrl}/chats?count=50&offset=0`,
-        `${agentUrl}/proxy/whapi/chats?count=50`,
-        { headers: wapiHdr },
-        { headers: proxyHdr }
-      );
-      const data = await res.json();
-      const chatsArr = Array.isArray(data?.chats) ? data.chats : Array.isArray(data) ? data : [];
-      if (chatsArr.length > 0) {
-        const mapped = chatsArr.map(mapChat);
-        setChats(mapped);
-        if (!active || !mapped.find(m => m.id === active.id)) setActive(mapped[0]);
-      }
-      setLastFetch(new Date());
-    } catch(e) {
-      setFetchErr(e.message);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const fetchMessages = async (chatId) => {
-    if (!wapiOk || !wapiToken || !chatId) return;
-    try {
-      const res = await fetchWithFallback(
-        `${wapiUrl}/messages/list?chat_id=${encodeURIComponent(chatId)}&count=50`,
-        `${agentUrl}/proxy/whapi/messages?chat_id=${encodeURIComponent(chatId)}&count=50`,
-        { headers: wapiHdr },
-        { headers: proxyHdr }
-      );
-      const data = await res.json();
-      const msgsArr = Array.isArray(data?.messages) ? data.messages : Array.isArray(data) ? data : [];
-      if (msgsArr.length > 0) {
-        const mapped = [...msgsArr].reverse().map(mapMsg);
-        setChats(cs => cs.map(c => c.id === chatId ? {...c, messages: mapped, unread: 0} : c));
-        setLastFetch(new Date());
-      }
-    } catch(e) { /* silent on message fetch fail — keep existing */ }
-  };
-
-  // ── Auto-fetch on mount & every 30s when connected ──
-  useEffect(() => {
-    if (wapiOk) {
-      fetchChats();
-      const interval = setInterval(fetchChats, 30000);
-      return () => clearInterval(interval);
-    }
-  }, [wapiOk, wapiToken]);
-
-  // ── Fetch messages when switching chats ──
-  useEffect(() => {
-    if (wapiOk && active?.id) fetchMessages(active.id);
-  }, [active?.id, wapiOk]);
-
-  // ── Scroll to bottom on new messages ──
-  useEffect(() => {
-    msgEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [chats, active?.id]);
-
-  const cur = chats.find(c=>c.id===active?.id);
-  const filteredChats = chats.filter(c =>
-    c.name.toLowerCase().includes(searchQ.toLowerCase()) ||
-    c.lastMsg.toLowerCase().includes(searchQ.toLowerCase())
-  );
-
-  const send = async () => {
-    if(!inp.trim()||!active) return;
-    const text = inp.trim();
-    setInp("");
-    const newMsg = { id:Date.now(), from:"us", text, time: new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}), intent:null };
-    setChats(cs=>cs.map(c=>c.id===active.id ? {...c, messages:[...c.messages, newMsg], lastMsg:text} : c));
-    // Send via Whapi if connected
-    if (wapiOk && wapiToken && conn.erpCompanyId) {
-      setSending(true);
-      try {
-        try {
-          await fetchWithFallback(
-            `${wapiUrl}/messages/text`,
-            `${agentUrl}/proxy/whapi/send`,
-            { method:"POST", headers: wapiHdr,  body: JSON.stringify({ to: active.id, body: text }) },
-            { method:"POST", headers: proxyHdr, body: JSON.stringify({ to: active.id, body: text }) }
-          );
-        } catch(_) {}
-      } catch(e) {} finally { setSending(false); }
-    }
-  };
-
-  const totalUnread = chats.reduce((a,c)=>a+c.unread,0);
-
-  return (
-    <div style={{display:"flex",flexDirection:"column",height:"calc(100vh - 52px)",overflow:"hidden"}}>
-      {/* Connection banner */}
-      {!wapiOk && (
-        <div style={{padding:"10px 20px",background:"#f59e0b15",borderBottom:"1px solid #f59e0b30",display:"flex",alignItems:"center",gap:10,fontSize:12,color:"var(--warn)",flexShrink:0}}>
-          <span>⚠️</span>
-          <span>WhatsApp not connected — showing demo data. </span>
-          <span style={{color:"var(--text2)"}}>Go to</span>
-          <strong style={{color:"var(--warn)"}}>WA Settings</strong>
-          <span style={{color:"var(--text2)"}}>to connect your Whapi channel.</span>
-        </div>
-      )}
-      {wapiOk && (
-        <div style={{padding:"8px 20px",background:"#00d9a310",borderBottom:"1px solid #00d9a330",display:"flex",alignItems:"center",gap:8,fontSize:12,color:"var(--accent)",flexShrink:0}}>
-          <span style={{width:7,height:7,borderRadius:"50%",background:"var(--accent)",display:"inline-block"}}/>
-          <span>Connected · Channel <strong>{wapiChannelId}</strong>{wapiPhoneNumber && <> · +{wapiPhoneNumber}</>} · {totalUnread} unread</span>
-          <span style={{marginLeft:"auto",color:"var(--text2)"}}>
-            {loading
-              ? "Syncing…"
-              : fetchErr
-                ? <span style={{color:"#f59e0b",cursor:"help"}} title={fetchErr}>⚠ {fetchErr}</span>
-                : lastFetch
-                  ? `Synced ${lastFetch.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})}`
-                  : "Ready"}
-          </span>
-        </div>
-      )}
-      {wapiOk && fetchErr && (
-        <div style={{padding:"12px 20px",background:"#f59e0b08",borderBottom:"1px solid #f59e0b20",fontSize:12,flexShrink:0}}>
-          <div style={{fontWeight:700,color:"#f59e0b",marginBottom:6}}>⚠ Cannot load messages — choose a fix:</div>
-          <div style={{display:"flex",gap:24,flexWrap:"wrap"}}>
-            <div>
-              <div style={{fontWeight:600,color:"var(--text)",marginBottom:3}}>Option A · Add proxy to your agent (recommended)</div>
-              <code style={{fontSize:11,color:"var(--text2)",fontFamily:"monospace",display:"block"}}>
-                # Copy whapi_proxy_routes.py to your agent folder, then in main.py:<br/>
-                from whapi_proxy_routes import router as whapi_router<br/>
-                app.include_router(whapi_router)<br/>
-                # Also add CORSMiddleware with allow_origins=["*"]
-              </code>
-            </div>
-            <div>
-              <div style={{fontWeight:600,color:"var(--text)",marginBottom:3}}>Option B · Check agent is running</div>
-              <code style={{fontSize:11,color:"var(--text2)",fontFamily:"monospace",display:"block"}}>
-                curl {conn.agentUrl || "http://158.140.133.82:8000"}/health<br/>
-                # Should return 200. If not, start the agent first.
-              </code>
-            </div>
-          </div>
-        </div>
-      )}
-      <div className="wa-layout" style={{flex:1,overflow:"hidden"}}>
-        <div className="wa-sidebar">
-          <div style={{padding:"10px 14px 0",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
-            <span style={{fontSize:11,fontWeight:700,color:"var(--text2)",textTransform:"uppercase",letterSpacing:1}}>
-              {loading ? "Syncing…" : `${filteredChats.length} chat${filteredChats.length!==1?"s":""}`}
-            </span>
-            {wapiOk && <button className="btn btn-ghost" style={{fontSize:11,padding:"3px 8px"}} onClick={fetchChats} title="Refresh">↻ Refresh</button>}
-          </div>
-          <div className="wa-search">
-            <input placeholder="Search conversations..." value={searchQ} onChange={e=>setSearchQ(e.target.value)} style={{width:"100%",background:"var(--bg3)",border:"1px solid var(--border)",borderRadius:20,padding:"8px 14px",color:"var(--text)",fontSize:13,outline:"none"}}/>
-          </div>
-          <div className="wa-list">{filteredChats.map((c,i)=>(
-            <div key={c.id} className={`wa-chat-item${active?.id===c.id?" active":""}`} onClick={()=>setActive(c)}>
-              <div className={`wa-avatar ${getAV(i)}`} style={{position:"relative"}}>{c.avatar}{c.online&&<div className="wa-online-dot"/>}</div>
-              <div className="wa-chat-info">
-                <div className="wa-chat-name">{c.name}</div>
-                <div className="wa-chat-preview">{c.lastMsg}</div>
-              </div>
-              <div className="wa-chat-meta">
-                <div className="wa-time">{c.time}</div>
-                {c.unread>0&&<div className="wa-unread">{c.unread}</div>}
-              </div>
-            </div>
-          ))}</div>
-        </div>
-
-        {cur ? (
-          <div className="wa-window">
-            <div className="wa-header">
-              <div className={`wa-avatar ${getAV(chats.findIndex(c=>c.id===cur.id))}`} style={{width:36,height:36,fontSize:12}}>{cur.avatar}</div>
-              <div style={{flex:1}}>
-                <div style={{fontWeight:700,fontSize:14}}>{cur.name}</div>
-                <div style={{fontSize:11,color:"var(--accent)"}}>{cur.online?"● Online":"Last seen recently"}</div>
-              </div>
-              <div style={{fontSize:11,color:"var(--text2)",marginRight:4}}>{cur.phone || (wapiPhoneNumber ? `+${wapiPhoneNumber}` : "")}</div>
-              <button className="btn btn-ghost btn-sm" onClick={()=>fetchMessages(cur.id)} title="Refresh messages">↻</button>
-              <button className="btn btn-ghost btn-sm">📋 Profile</button>
-              <button className="btn btn-primary btn-sm">🛒 Create Order</button>
-            </div>
-
-            <div className="wa-messages">
-              {cur.messages.map(m=>(
-                <div key={m.id} className={`wa-msg-row ${m.from}`}>
-                  <div className={`wa-bubble ${m.from}`}>
-                    <div>{m.text}</div>
-                    {m.intent&&<IntentTag intent={m.intent}/>}
-                    <div className="wa-bubble-time">{m.time}</div>
-                  </div>
-                </div>
-              ))}
-            </div>
-
-            <div className="wa-input-bar">
-              <button className="btn btn-ghost" style={{padding:"8px 12px"}}>📎</button>
-              <input className="wa-input" placeholder="Type a message..." value={inp}
-                onChange={e=>setInp(e.target.value)}
-                onKeyDown={e=>e.key==="Enter"&&send()}/>
-              <button className="btn btn-primary" onClick={send} disabled={sending}>{sending?"Sending…":"Send"}</button>
-            </div>
-            <div ref={msgEndRef}/>
-          </div>
-        ) : (
-          <div className="wa-empty">
-            <svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-            <div style={{fontWeight:600}}>No conversations found</div>
-            <div style={{fontSize:13}}>AI detects order intents automatically</div>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// ─── FIELD + SECTION HELPERS ─────────────────────────────────────────────────
-function Field({ label, hint, children }) {
-  return (
-    <div className="form-group">
-      <label className="form-label">{label}</label>
-      {children}
-      {hint && <div style={{ fontSize: 11, color: "var(--text2)", marginTop: 4 }}>{hint}</div>}
-    </div>
-  );
-}
-function SectionDivider({ label }) {
-  return (
-    <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "18px 0 14px" }}>
-      <div style={{ height: 1, flex: 1, background: "var(--border)" }} />
-      <span style={{ fontSize: 10, letterSpacing: 2, textTransform: "uppercase", color: "var(--text2)", fontWeight: 700 }}>{label}</span>
-      <div style={{ height: 1, flex: 1, background: "var(--border)" }} />
-    </div>
-  );
-}
-function StatusBadge({ ok, testing, error }) {
-  if (testing) return <span style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 12, color: "var(--warn)" }}><span style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--warn)", display: "inline-block" }} />Testing…</span>;
-  if (error)   return <span style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 12, color: "var(--danger)" }}><span style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--danger)", display: "inline-block" }} />{error}</span>;
-  if (ok)      return <span style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 12, color: "var(--accent)", fontWeight: 600 }}><span style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--accent)", display: "inline-block" }} />Connected</span>;
-  return       <span style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 12, color: "var(--text2)" }}><span style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--text2)", display: "inline-block" }} />Not Connected</span>;
-}
-function InfoBox({ color = "#60a5fa", icon, children }) {
-  return <div style={{ padding: "10px 14px", background: color + "12", border: `1px solid ${color}30`, borderRadius: "var(--r2)", fontSize: 12, color, lineHeight: 1.7, marginTop: 12 }}>{icon && <span style={{ marginRight: 6 }}>{icon}</span>}{children}</div>;
-}
-
-// ─── CONNECT SCREEN ───────────────────────────────────────────────────────────
-function ConnectScreen({ defaultTab = "erp", conn, setConn }) {
-  const [tab, setTab] = useState(defaultTab);
-
-  // ── ERP local UI state (non-sensitive, stays local) ──
-  const [erpShowPw,    setErpShowPw]    = useState(false);
-  const [erpTesting,   setErpTesting]   = useState(false);
-  const [erpError,     setErpError]     = useState("");
-
-  // Lifted state via conn prop
-  const erpApiUrl    = conn.erpApiUrl;    const setErpApiUrl    = v => setConn(c=>({...c, erpApiUrl:v}));
-  const erpUsername  = conn.erpUsername;  const setErpUsername  = v => setConn(c=>({...c, erpUsername:v}));
-  const erpPassword  = conn.erpPassword;  const setErpPassword  = v => setConn(c=>({...c, erpPassword:v}));
-  const erpCompanyId = conn.erpCompanyId; const setErpCompanyId = v => setConn(c=>({...c, erpCompanyId:v}));
-  const erpTimezone  = conn.erpTimezone;  const setErpTimezone  = v => setConn(c=>({...c, erpTimezone:v}));
-  const erpToken     = conn.erpToken;     const setErpToken     = v => setConn(c=>({...c, erpToken:v}));
-  const erpUserId    = conn.erpUserId;    const setErpUserId    = v => setConn(c=>({...c, erpUserId:v}));
-  const erpOk        = conn.erpOk;        const setErpOk        = v => setConn(c=>({...c, erpOk:v}));
-  const erpLastSync  = conn.erpLastSync;  const setErpLastSync  = v => setConn(c=>({...c, erpLastSync:v}));
-  const wapiUrl      = conn.wapiUrl;      const setWapiUrl      = v => setConn(c=>({...c, wapiUrl:v}));
-  const wapiToken    = conn.wapiToken;    const setWapiToken    = v => setConn(c=>({...c, wapiToken:v}));
-  const wapiChannelId   = conn.wapiChannelId;   const setWapiChannelId   = v => setConn(c=>({...c, wapiChannelId:v}));
-  const wapiPhoneNumber = conn.wapiPhoneNumber; const setWapiPhoneNumber = v => setConn(c=>({...c, wapiPhoneNumber:v}));
-  const wapiOk       = conn.wapiOk;       const setWapiOk       = v => setConn(c=>({...c, wapiOk:v}));
-  const agentUrl     = conn.agentUrl;     const setAgentUrl     = v => setConn(c=>({...c, agentUrl:v}));
-  const webhookSecret= conn.webhookSecret;const setWebhookSecret= v => setConn(c=>({...c, webhookSecret:v}));
-
-  const [wapiShowToken, setWapiShowToken] = useState(false);
-  const [wapiTesting,   setWapiTesting]   = useState(false);
-  const [wapiError,     setWapiError]     = useState("");
-
-
-  const testErpConnection = async () => {
-    if (!erpApiUrl || !erpUsername || !erpPassword) {
-      setErpError("Please fill in all required fields."); return;
-    }
-    setErpTesting(true); setErpError(""); setErpOk(false);
-    try {
-      const fd = new FormData();
-      fd.append("username", erpUsername);
-      fd.append("password", erpPassword);
-      fd.append("grant_type", "password");
-      fd.append("notification", "false");
-      // Clean URL — strip trailing slash, ensure /api is present
-      const cleanUrl = erpApiUrl.replace(/\/+$/, '');
-      const loginUrl = cleanUrl.endsWith('/api') ? `${cleanUrl}/login`
-                     : cleanUrl.includes('/api/') ? `${cleanUrl.split('/api/')[0]}/api/login`
-                     : `${cleanUrl}/api/login`;
-      console.log('Attempting login at:', loginUrl);
-
-      let data = null;
-      const _agUrl = (conn.agentUrl || window.AGENT_URL || "").replace(/\/+$/, "");
-
-      // Always go via Railway backend proxy (avoids CORS completely)
-      if (_agUrl) {
-        console.log("Logging in via backend proxy:", _agUrl);
-        try {
-          const proxyRes = await fetch(`${_agUrl}/proxy/snc/login`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ api_url: loginUrl, username: erpUsername, password: erpPassword })
-          });
-          const proxyData = await proxyRes.json();
-          if (!proxyRes.ok) throw new Error(proxyData.detail || `HTTP ${proxyRes.status}`);
-          data = proxyData;
-          console.log("Proxy login success:", data.access_token ? "got token" : "no token");
-        } catch(proxyErr) {
-          throw new Error(`Login failed: ${proxyErr.message}`);
+    # Rule-based fallback function
+    def rule_based():
+        intent, confidence = detect_intent_rules(message_text)
+        return {
+            "intent": intent,
+            "confidence": confidence,
+            "items": extract_order_items(message_text),
+            "order_number": extract_order_number(message_text),
+            "summary": f"Detected {intent} with {confidence:.0%} confidence",
+            "suggested_reply": None,
+            "method": "rule-based",
         }
-      } else {
-        // No backend URL set — try direct (may fail due to CORS)
-        console.warn("No backend URL set — trying direct (may fail due to CORS)");
-        try {
-          const res = await fetch(loginUrl, { method: "POST", body: fd });
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
-          data = await res.json();
-        } catch(e) {
-          throw new Error(`Login failed: ${e.message}. Set your Railway backend URL in the bottom-right corner first!`);
-        }
-      }
 
-      if (data && data.access_token) {
-        const ts = new Date().toLocaleString();
-        setConn(c => ({ ...c, erpToken: data.access_token, erpUserId: data.user_id || "", erpOk: true, erpLastSync: ts }));
-        // Sync credentials to backend agent
-        const _agUrl = conn.agentUrl || window.AGENT_URL || "";
-        try { await fetch(_agUrl+"/credentials",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({snc:{api_url:erpApiUrl,access_token:data.access_token,user_id:data.user_id||"",username:erpUsername,company_id:erpCompanyId,timezone:erpTimezone}})}); } catch(_){}
-      } else {
-        throw new Error((data && data.detail) || "Login failed — check your username and password");
-      }
-    } catch (e) {
-      setErpError(e.message || "Connection failed");
-    } finally {
-      setErpTesting(false);
-    }
-  };
+    if not anthropic_key and not openai_key:
+        return rule_based()
 
-  // ── Webhook URLs (constants) ──
-  const erpWebhookUrl  = "https://oneaether.ai/webhook/snc";
-  const wapiWebhookUrl = "https://oneaether.ai/webhook/whatsapp";
+    # Build shared prompt content
+    context_str = ""
+    if recent_context:
+        context_str = "\n".join([f"{m['role'].upper()}: {m['text']}" for m in recent_context[-4:]])
 
-  const testWapiConnection = async () => {
-    if (!wapiToken || !wapiChannelId) {
-      setWapiError("Token and Channel ID are required."); return;
-    }
-    setWapiTesting(true); setWapiError("");
-    let statusOk = false;
-    try {
-      // Try Whapi channel status endpoint
-      const res = await fetch(`${wapiUrl}/channels/${wapiChannelId}`, {
-        headers: { Authorization: `Bearer ${wapiToken}`, Accept: "application/json" }
-      });
-      if (res.ok) {
-        const data = await res.json();
-        // status field: "authenticated" | "connected" means live
-        const status = data?.status?.toLowerCase() || "";
-        statusOk = ["authenticated","connected","active"].some(s => status.includes(s)) || res.ok;
-      } else if (res.status === 401) {
-        setWapiError("Invalid token — please check your Whapi bearer token."); 
-      } else {
-        statusOk = true; // other errors may be network/CORS — assume OK
-      }
-    } catch(_) {
-      statusOk = true; // CORS/network blocked — assume creds are correct, mark connected
-    }
-    if (statusOk) {
-      setConn(c => ({ ...c, wapiOk: true, wapiUrl, wapiToken, wapiChannelId, wapiPhoneNumber, agentUrl, webhookSecret }));
-    }
-    setWapiTesting(false);
-  };
+    system_prompt = """You are an AI agent for a B2B food distribution company using WhatsApp for orders.
+Analyze incoming WhatsApp messages and extract structured intent and order data.
+Always respond with valid JSON only — no markdown, no explanation.
 
-  const copyToClipboard = (text) => {
-    navigator.clipboard?.writeText(text).catch(() => {});
-  };
+Intent types:
+- NEW_ORDER: Customer wants to place a new order
+- AMEND_ORDER: Customer wants to change an existing order
+- CANCEL_ORDER: Customer wants to cancel an order
+- ORDER_STATUS: Customer asking about order status/tracking
+- ENQUIRY: Product/price/availability question
+- GREETING: Just saying hello
+- UNKNOWN: Cannot determine intent
 
-  const TIMEZONES = [
-    "Asia/Kuala_Lumpur","Asia/Singapore","Asia/Calcutta","Asia/Kolkata",
-    "Asia/Jakarta","Asia/Bangkok","Asia/Manila","UTC","America/New_York","Europe/London",
-  ];
-
-  return (
-    <div style={{ display: "flex", height: "calc(100vh - 52px)", overflow: "hidden" }}>
-      {/* Left: tabs + forms */}
-      <div style={{ flex: 1, overflow: "auto", padding: "24px" }}>
-        <div className="tabs mb-4">
-          {[
-            { key: "erp",    label: "⚡ SellnChill ERP" },
-            { key: "whapi",  label: "💬 WhatsApp" },
-            { key: "upload", label: "📤 Manual Upload" },
-          ].map(t => (
-            <div key={t.key} className={`tab ${tab === t.key ? "active" : ""}`} onClick={() => setTab(t.key)}>{t.label}</div>
-          ))}
-        </div>
-
-        {/* ── ERP TAB ── */}
-        {tab === "erp" && (
-          <div style={{ maxWidth: 600 }}>
-            <div className="card">
-              <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 18 }}>
-                <div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
-                    <div className="connect-icon" style={{ background: "#7c4dff20", width: 40, height: 40, marginBottom: 0, fontSize: 18 }}>⚡</div>
-                    <div>
-                      <div className="connect-title" style={{ marginBottom: 2 }}>SellnChill ERP</div>
-                      <div style={{ fontSize: 12, color: "var(--text2)" }}>sellnchill.com · delivernchill.com</div>
-                    </div>
-                  </div>
-                </div>
-                <StatusBadge ok={erpOk} testing={erpTesting} error={erpError} />
-              </div>
-
-              <SectionDivider label="Server" />
-
-              <Field label="API Base URL *" hint="e.g. http://158.140.133.83:5000 or https://dev2.snc.delivernchill.com/api">
-                <input className="form-input" value={erpApiUrl} onChange={e => setErpApiUrl(e.target.value.trim())} placeholder="http://158.140.133.83:5000" />
-              </Field>
-
-              <SectionDivider label="Authentication" />
-
-              <Field label="Username / Email *" hint="Your SellnChill login email">
-                <input className="form-input" type="email" value={erpUsername} onChange={e => setErpUsername(e.target.value)} placeholder="admin@yourcompany.com" autoComplete="username" />
-              </Field>
-
-              <Field label="Password *">
-                <div style={{ position: "relative" }}>
-                  <input className="form-input" type={erpShowPw ? "text" : "password"} value={erpPassword} onChange={e => setErpPassword(e.target.value)} placeholder="Your SellnChill password" autoComplete="current-password" style={{ paddingRight: 40 }} />
-                  <button onClick={() => setErpShowPw(v => !v)} style={{ position: "absolute", right: 10, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", color: "var(--text2)", cursor: "pointer", fontSize: 14 }}>
-                    {erpShowPw ? "🙈" : "👁"}
-                  </button>
-                </div>
-              </Field>
-
-              <SectionDivider label="Company Details" />
-
-              <Field label="Company ID *" hint="Your SellnChill company slug, e.g. mindmasters">
-                <input className="form-input" value={erpCompanyId} onChange={e => setErpCompanyId(e.target.value.trim())} placeholder="e.g. mindmasters" />
-              </Field>
-
-              <Field label="Timezone" hint="Used in all API requests">
-                <select className="form-input" value={erpTimezone} onChange={e => setErpTimezone(e.target.value)}>
-                  {TIMEZONES.map(tz => <option key={tz} value={tz}>{tz}</option>)}
-                </select>
-              </Field>
-
-              {erpOk && (
-                <>
-                  <SectionDivider label="Retrieved from Login" />
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-                    <Field label="Access Token">
-                      <div style={{ position: "relative" }}>
-                        <input className="form-input" value={erpToken} readOnly style={{ paddingRight: 60, fontFamily: "monospace", fontSize: 10, opacity: 0.7 }} />
-                        <button onClick={() => copyToClipboard(erpToken)} style={{ position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", color: "var(--accent)", cursor: "pointer", fontSize: 11, fontWeight: 700 }}>COPY</button>
-                      </div>
-                    </Field>
-                    <Field label="User ID">
-                      <input className="form-input" value={erpUserId || "(returned on login)"} readOnly style={{ fontFamily: "monospace", fontSize: 11, opacity: 0.7 }} />
-                    </Field>
-                  </div>
-                </>
-              )}
-
-              {erpError && <InfoBox color="#ff4d6d" icon="⚠️">{erpError}</InfoBox>}
-
-              <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
-                <button className="btn btn-primary" style={{ flex: 1, justifyContent: "center" }}
-                  onClick={testErpConnection} disabled={erpTesting || !erpApiUrl || !erpUsername || !erpPassword}>
-                  {erpTesting ? "Testing connection…" : erpOk ? "✓ Connected — Re-authenticate" : "Test & Connect"}
-                </button>
-                {erpOk && (
-                  <button className="btn btn-ghost" onClick={() => setConn(c=>({...c, erpOk:false, erpToken:"", erpUserId:""}))}>Disconnect</button>
-                )}
-              </div>
-
-              {erpOk && (
-                <InfoBox color="#00d9a3" icon="✓">
-                  Connected to <strong>{erpCompanyId}</strong>. Bearer token stored for API calls.
-                  {erpLastSync && <> Last authenticated: {erpLastSync}.</>} Customers, orders and products will now sync automatically.
-                </InfoBox>
-              )}
-
-              <SectionDivider label="API Endpoints (read-only reference)" />
-              <div style={{ background: "var(--bg3)", borderRadius: "var(--r2)", padding: "12px 14px", fontSize: 11, fontFamily: "monospace", lineHeight: 2, color: "var(--text2)" }}>
-                {[
-                  ["POST", "/login",              "Authenticate → get access_token"],
-                  ["GET",  "/job/{jobId}",         "Poll async job result"],
-                  ["POST", "/customers/get",       "Fetch customer list / detail"],
-                  ["POST", "/products/list",       "Fetch product catalogue"],
-                  ["POST", "/b2b/orders/get",      "Fetch B2B orders"],
-                  ["POST", "/b2b/order/save",      "Create or modify order"],
-                  ["POST", "/whatsapp/messages/send","Send WhatsApp message"],
-                  ["POST", "/whatsapp/contacts/get","Get WhatsApp contacts"],
-                ].map(([method, path, desc]) => (
-                  <div key={path} style={{ display: "flex", gap: 8 }}>
-                    <span style={{ color: method === "POST" ? "#f59e0b" : "#60a5fa", minWidth: 36 }}>{method}</span>
-                    <span style={{ color: "var(--text)", minWidth: 230 }}>{path}</span>
-                    <span style={{ color: "var(--text2)" }}>— {desc}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* ── WHAPI TAB ── */}
-        {tab === "whapi" && (
-          <div style={{ maxWidth: 600 }}>
-            <div className="card">
-              <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 18 }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                  <div className="connect-icon" style={{ background: "#25d36620", width: 40, height: 40, marginBottom: 0, fontSize: 18 }}>💬</div>
-                  <div>
-                    <div className="connect-title" style={{ marginBottom: 2 }}>WhatsApp via Whapi.cloud</div>
-                    <div style={{ fontSize: 12, color: "var(--text2)" }}>whapi.cloud API</div>
-                  </div>
-                </div>
-                <StatusBadge ok={wapiOk} testing={wapiTesting} error={wapiError} />
-              </div>
-
-              <SectionDivider label="Whapi Credentials" />
-
-              <Field label="Whapi API Base URL">
-                <input className="form-input" value={wapiUrl} onChange={e => setWapiUrl(e.target.value.trim())} placeholder="https://gate.whapi.cloud" />
-              </Field>
-
-              <Field label="Bearer Token *" hint="From your Whapi.cloud dashboard → Channels → Token">
-                <div style={{ position: "relative" }}>
-                  <input className="form-input" type={wapiShowToken ? "text" : "password"} value={wapiToken} onChange={e => setWapiToken(e.target.value.trim())} placeholder="eyJ..." style={{ paddingRight: 80 }} />
-                  <div style={{ position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)", display: "flex", gap: 6 }}>
-                    <button onClick={() => setWapiShowToken(v => !v)} style={{ background: "none", border: "none", color: "var(--text2)", cursor: "pointer", fontSize: 13 }}>{wapiShowToken ? "🙈" : "👁"}</button>
-                    {wapiToken && <button onClick={() => copyToClipboard(wapiToken)} style={{ background: "none", border: "none", color: "var(--accent)", cursor: "pointer", fontSize: 10, fontWeight: 700 }}>COPY</button>}
-                  </div>
-                </div>
-              </Field>
-
-              <Field label="Channel ID *" hint="Your Whapi channel / instance ID, e.g. SHAZAM-HGS85">
-                <input className="form-input" value={wapiChannelId} onChange={e => setWapiChannelId(e.target.value.trim())} placeholder="e.g. SHAZAM-HGS85" />
-              </Field>
-
-              <Field label="WhatsApp Phone Number" hint="Your linked WhatsApp number in international format, e.g. 60123456789">
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <span style={{ fontSize: 13, color: "var(--text2)", padding: "0 4px" }}>+</span>
-                  <input className="form-input" value={wapiPhoneNumber} onChange={e => setWapiPhoneNumber(e.target.value.replace(/\D/g,""))} placeholder="60123456789 (no + or spaces)" style={{ flex: 1 }} />
-                </div>
-              </Field>
-
-              <SectionDivider label="Webhook Settings" />
-
-              <Field label="Incoming Message Webhook URL" hint="Set this URL in your Whapi.cloud channel webhook settings">
-                <div style={{ position: "relative" }}>
-                  <input className="form-input" value={wapiWebhookUrl} readOnly style={{ paddingRight: 60, fontFamily: "monospace", fontSize: 11, opacity: 0.8 }} />
-                  <button onClick={() => copyToClipboard(wapiWebhookUrl)} style={{ position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", color: "var(--accent)", cursor: "pointer", fontSize: 10, fontWeight: 700 }}>COPY</button>
-                </div>
-              </Field>
-
-              <Field label="Webhook Secret (optional)" hint="Used to validate incoming webhook payloads">
-                <input className="form-input" type="password" value={webhookSecret} onChange={e => setWebhookSecret(e.target.value)} placeholder="Optional HMAC secret..." />
-              </Field>
-
-              <SectionDivider label="AI Agent Settings" />
-
-              <Field label="Agent Webhook URL" hint="Your AI agent endpoint that processes incoming WhatsApp messages">
-                <input className="form-input" value={agentUrl} onChange={e => setAgentUrl(e.target.value.trim())} placeholder="http://158.140.133.82:8000" />
-              </Field>
-
-              <div style={{ padding: "10px 14px", background: "var(--bg3)", borderRadius: "var(--r2)", fontSize: 11, fontFamily: "monospace", lineHeight: 1.9, color: "var(--text2)", marginTop: 4 }}>
-                <div style={{ color: "var(--text)", fontWeight: 600, fontFamily: "var(--fb)", fontSize: 12, marginBottom: 6 }}>Message flow:</div>
-                <div>WhatsApp message → Whapi.cloud → <span style={{ color: "var(--accent)" }}>{wapiWebhookUrl}</span></div>
-                <div>→ oneaether.ai processes intent → <span style={{ color: "#f59e0b" }}>{agentUrl}/process-message</span></div>
-                <div>→ Creates order in SellnChill ERP via <span style={{ color: "#60a5fa" }}>{erpApiUrl || "SellnChill API"}</span></div>
-              </div>
-
-              {wapiError && <InfoBox color="#ff4d6d" icon="⚠️">{wapiError}</InfoBox>}
-
-              <div style={{ display: "flex", gap: 10, marginTop: 20, flexWrap: "wrap" }}>
-                <button className="btn btn-primary" style={{ flex: 1, justifyContent: "center", minWidth: 140 }}
-                  onClick={() => {
-                    if (!wapiToken || !wapiChannelId) { setWapiError("Token and Channel ID are required."); return; }
-                    setConn(c => ({ ...c, wapiOk: true, wapiUrl, wapiToken, wapiChannelId, wapiPhoneNumber, agentUrl, webhookSecret }));
-                    setWapiError("");
-                  }}
-                  disabled={!wapiToken || !wapiChannelId}>
-                  {wapiOk ? "✓ Update Settings" : "💾 Save & Connect"}
-                </button>
-                <button className="btn btn-ghost" style={{ justifyContent: "center", minWidth: 120 }}
-                  onClick={testWapiConnection} disabled={wapiTesting || !wapiToken || !wapiChannelId}
-                  title="Sends a test request to Whapi to verify your token">
-                  {wapiTesting ? "Testing…" : "🔍 Test API"}
-                </button>
-                {wapiOk && <button className="btn btn-ghost" style={{color:"var(--danger)"}} onClick={() => setConn(c=>({...c, wapiOk:false}))}>Disconnect</button>}
-              </div>
-              <div style={{fontSize:11,color:"var(--text2)",marginTop:8,lineHeight:1.6}}>
-                💡 <strong>Note:</strong> Browser security (CORS) may block direct API tests. Use <em>Save & Connect</em> to save your credentials — messages will load via your backend agent at <code>{agentUrl}</code>.
-              </div>
-
-              {wapiOk && (
-                <InfoBox color="#25d366" icon="✓">
-                  WhatsApp channel <strong>{wapiChannelId}</strong> saved &amp; connected. Go to <strong>WhatsApp Inbox</strong> to see messages — they load automatically from Whapi.cloud.
-                </InfoBox>
-              )}
-
-              <SectionDivider label="Send Message API reference" />
-              <div style={{ background: "var(--bg3)", borderRadius: "var(--r2)", padding: "12px 14px", fontSize: 11, lineHeight: 1.7 }}>
-                <div style={{ fontFamily: "monospace", color: "var(--text2)" }}>POST {wapiUrl || "https://gate.whapi.cloud"}/messages/send</div>
-                <div style={{ marginTop: 8, fontFamily: "monospace", fontSize: 10, color: "var(--text2)", whiteSpace: "pre-wrap" }}>{`Authorization: Bearer <token>
+JSON response format:
 {
-  "company_id": "${erpCompanyId || "<company_id>"}",
-  "data": {
-    "contact_id": "<chat_id>",
-    "type": "text",          // or "image"
-    "body": "Your message"
-  }
-}`}</div>
-              </div>
-            </div>
-          </div>
-        )}
+  "intent": "NEW_ORDER",
+  "confidence": 0.95,
+  "items": [{"name": "product name", "qty": 5, "uom": "boxes"}],
+  "order_number": null,
+  "summary": "one sentence summary",
+  "suggested_reply": "friendly professional reply to send back",
+  "urgency": "normal"
+}"""
 
-        {/* ── UPLOAD TAB ── */}
-        {tab === "upload" && (
-          <div style={{ maxWidth: 600 }}>
-            <div className="card">
-              <div style={{ marginBottom: 18 }}>
-                <div className="connect-title">Manual Data Upload</div>
-                <div className="connect-desc">Import data directly by uploading CSV files. Use this if you don't have direct ERP access.</div>
-              </div>
-              {[
-                { label: "Customer Data",     desc: "Required columns: name, phone, email, total_orders, revenue, last_order_date",     icon: "👥" },
-                { label: "Order History",     desc: "Required columns: order_id, customer_id, order_date, amount, status, products",   icon: "🛒" },
-                { label: "Product Catalogue", desc: "Required columns: sku, name, price, category, uom, status",                       icon: "📦" },
-              ].map((u, i) => (
-                <div key={i} style={{ marginBottom: 18 }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-                    <span style={{ fontSize: 16 }}>{u.icon}</span>
-                    <div style={{ fontWeight: 600, fontSize: 13 }}>{u.label}</div>
-                  </div>
-                  <div style={{ fontSize: 12, color: "var(--text2)", marginBottom: 8 }}>{u.desc}</div>
-                  <div className="upload-zone">
-                    <div style={{ fontSize: 24, marginBottom: 6 }}>📤</div>
-                    <div style={{ fontWeight: 600 }}>Drop CSV / Excel file here</div>
-                    <div style={{ fontSize: 12, marginTop: 4 }}>or click to browse</div>
-                  </div>
-                </div>
-              ))}
-              <InfoBox color="#60a5fa" icon="ℹ️">
-                Uploaded data will be used for CRM analytics and AI insights. For real-time order sync, connect via the SellnChill ERP tab.
-              </InfoBox>
-            </div>
-          </div>
-        )}
-      </div>
+    user_prompt = f"""Analyze this WhatsApp message:
 
-      {/* Right: connection status sidebar */}
-      <div style={{ width: 240, borderLeft: "1px solid var(--border)", background: "var(--bg2)", padding: "20px 16px", overflow: "auto", flexShrink: 0 }}>
-        <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 1.5, color: "var(--text2)", fontWeight: 700, marginBottom: 14 }}>Connection Status</div>
+Sender: {sender_name}
+Customer account: {customer_name or 'Unknown'}
+Recent conversation:
+{context_str}
 
-        {[
-          { key: "erp",   label: "SellnChill ERP",   icon: "⚡", ok: erpOk,  detail: erpOk ? `${erpCompanyId} · ${erpApiUrl}` : "Not configured" },
-          { key: "whapi", label: "WhatsApp (Whapi)",  icon: "💬", ok: wapiOk, detail: wapiOk ? `Channel: ${wapiChannelId}` : "Not configured" },
-        ].map(c => (
-          <div key={c.key} style={{ padding: "12px", background: "var(--bg3)", borderRadius: "var(--r2)", marginBottom: 10, borderLeft: `3px solid ${c.ok ? "var(--accent)" : "var(--border)"}`, cursor: "pointer" }}
-            onClick={() => setTab(c.key)}>
-            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-              <span>{c.icon}</span>
-              <span style={{ fontWeight: 600, fontSize: 12 }}>{c.label}</span>
-              <span style={{ marginLeft: "auto", fontSize: 10, color: c.ok ? "var(--accent)" : "var(--text2)", fontWeight: 700 }}>{c.ok ? "✓ ON" : "OFF"}</span>
-            </div>
-            <div style={{ fontSize: 11, color: "var(--text2)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.detail}</div>
-          </div>
-        ))}
+Latest message: "{message_text}"
 
-        {erpOk && wapiOk && (
-          <InfoBox color="#00d9a3" icon="🚀">
-            All systems connected! WhatsApp orders will auto-process into SellnChill ERP.
-          </InfoBox>
-        )}
+Extract the intent and order details. Write a friendly, professional suggested_reply."""
 
-        {!erpOk || !wapiOk ? (
-          <div style={{ marginTop: 16 }}>
-            <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 1.5, color: "var(--text2)", fontWeight: 700, marginBottom: 10 }}>Setup Checklist</div>
-            {[
-              { done: !!erpApiUrl, label: "Set ERP base URL" },
-              { done: erpUsername,              label: "Enter ERP credentials" },
-              { done: erpCompanyId,             label: "Set company ID" },
-              { done: erpOk,                    label: "Authenticate with ERP" },
-              { done: wapiToken,                label: "Enter Whapi token" },
-              { done: wapiChannelId,            label: "Set channel ID" },
-              { done: wapiOk,                   label: "Connect WhatsApp" },
-            ].map((item, i) => (
-              <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 7, fontSize: 12 }}>
-                <span style={{ color: item.done ? "var(--accent)" : "var(--border)", fontSize: 14 }}>{item.done ? "✓" : "○"}</span>
-                <span style={{ color: item.done ? "var(--text)" : "var(--text2)" }}>{item.label}</span>
-              </div>
-            ))}
-          </div>
-        ) : null}
-      </div>
-    </div>
-  );
-}
+    # ── Try Anthropic Claude ──
+    if anthropic_key:
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={"x-api-key": anthropic_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                    json={"model": "claude-haiku-4-5-20251001", "max_tokens": 600,
+                          "system": system_prompt, "messages": [{"role": "user", "content": user_prompt}]},
+                )
+                data = resp.json()
+                text = data["content"][0]["text"].strip()
+                text = re.sub(r'^```json\s*|\s*```$', '', text.strip())
+                result = json.loads(text)
+                result["method"] = "claude-ai"
+                return result
+        except Exception as e:
+            logger.error(f"Claude API error: {e} — trying OpenAI fallback")
 
-// ─── NAV / APP ────────────────────────────────────────────────────────────────
-const NAV = [
-  {section:"AI CRM", items:[
-    {id:"dashboard",   label:"Dashboard",      icon:"⬛"},
-    {id:"ai-insights", label:"AI Insights",    icon:"✦"},
-    {id:"customers",   label:"Customers",      icon:"◈"},
-    {id:"segments",    label:"Segments",       icon:"◭", isNew:true},
-    {id:"products",    label:"Products",       icon:"◆"},
-    {id:"crm-connect", label:"Data Sources",   icon:"⊕"},
-  ]},
-  {section:"WhatsApp Orders", items:[
-    {id:"whatsapp",    label:"WhatsApp Inbox", icon:"◉", badge:6},
-    {id:"wa-connect",  label:"WA Settings",   icon:"⊙"},
-  ]},
-];
+    # ── Try OpenAI ──
+    if openai_key:
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"},
+                    json={
+                        "model": "gpt-4o-mini",
+                        "max_tokens": 600,
+                        "temperature": 0.2,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user",   "content": user_prompt},
+                        ],
+                        "response_format": {"type": "json_object"},
+                    },
+                )
+                data = resp.json()
+                text = data["choices"][0]["message"]["content"].strip()
+                result = json.loads(text)
+                result["method"] = "openai-gpt4o-mini"
+                return result
+        except Exception as e:
+            logger.error(f"OpenAI API error: {e} — falling back to rule-based")
 
-const TITLES = {
-  "dashboard":   {title:"Dashboard",           sub:"Business overview & key metrics"},
-  "ai-insights": {title:"AI Insights",          sub:"Ask anything about your business"},
-  "customers":   {title:"Customers",            sub:"Customer directory & segments"},
-  "segments":    {title:"Customer Segments",    sub:"Manual creation & AI-powered recommendations"},
-  "products":    {title:"Products",             sub:"Product performance analytics"},
-  "crm-connect": {title:"Data Sources",         sub:"Connect SellnChill ERP or upload data"},
-  "whatsapp":    {title:"WhatsApp Orders",      sub:"Live inbox with AI intent detection"},
-  "wa-connect":  {title:"WhatsApp Settings",    sub:"Connect via Whapi.cloud"},
-};
+    return rule_based()
 
-function App() {
-  const [screen, setScreen] = useState("dashboard");
-  const [customers, setCustomers] = useState(INITIAL_CUSTOMERS);
+# ─── Intent Handlers ────────────────────────────────────────────────────────
+# ─── Intent Handlers ──────────────────────────────────────────────────────────
 
-  // Single flat conn object — passed as prop so ConnectScreen & WhatsAppScreen share state
-  const [conn, setConn] = useState({
-    erpApiUrl:    "https://enterprise.sellnchill.com/api",
-    erpUsername:  "", erpPassword:  "", erpCompanyId: "",
-    erpTimezone:  "Asia/Kuala_Lumpur",
-    erpToken:     "", erpUserId:    "",
-    erpOk:        false, erpLastSync:  null,
-    wapiUrl:      "https://gate.whapi.cloud",
-    wapiToken:    "", wapiChannelId: "", wapiPhoneNumber: "",
-    wapiOk:       false,
-    agentUrl:     "https://oneaether-agent-production.up.railway.app",
-    webhookSecret:"",
-  });
+async def handle_new_order(analysis: Dict, sender_name: str, chat_id: str) -> str:
+    items = analysis.get("items", [])
+    if analysis.get("suggested_reply"):
+        return analysis["suggested_reply"]
 
-  const meta = TITLES[screen]||{title:screen,sub:""};
+    if not items:
+        return (
+            f"Hi {sender_name}! 🛒 I'd like to help you place an order.\n\n"
+            "Could you please specify:\n"
+            "• *Product name*\n"
+            "• *Quantity & unit* (e.g. 5 boxes, 10 pcs)\n"
+            "• *Delivery date*\n\n"
+            "Example: _I want 3 boxes chicken karaage and 10 pcs mushroom for delivery tomorrow_"
+        )
 
-  const render = () => {
-    switch(screen) {
-      case "dashboard":   return <DashboardScreen customers={customers} conn={conn}/>;
-      case "ai-insights": return <AIInsightsScreen/>;
-      case "customers":   return <CustomersScreen customers={customers}/>;
-      case "segments":    return <SegmentsScreen customers={customers} setCustomers={setCustomers}/>;
-      case "products":    return <ProductsScreen/>;
-      case "crm-connect": return <ConnectScreen defaultTab="erp"   conn={conn} setConn={setConn}/>;
-      case "whatsapp":    return <WhatsAppScreen conn={conn}/>;
-      case "wa-connect":  return <ConnectScreen defaultTab="whapi" conn={conn} setConn={setConn}/>;
-      default:            return <DashboardScreen customers={customers} conn={conn}/>;
+    item_lines = "\n".join([f"  • {i['name']} × {i['qty']} {i['uom']}" for i in items])
+    return (
+        f"Got it {sender_name}! 🛒 Let me confirm your order:\n\n"
+        f"{item_lines}\n\n"
+        f"✅ Please reply *CONFIRM* to place this order, or let me know if anything needs to change.\n"
+        f"📅 What delivery date would you like?"
+    )
+
+async def handle_amend_order(analysis: Dict, sender_name: str, chat_id: str) -> str:
+    if analysis.get("suggested_reply"):
+        return analysis["suggested_reply"]
+    order_num = analysis.get("order_number")
+    items = analysis.get("items", [])
+    msg = f"Got it {sender_name}! ✏️ Let me confirm the amendment:\n\n"
+    if order_num:
+        msg += f"📋 Order: *{order_num}*\n"
+    if items:
+        msg += "Changes requested:\n"
+        for i in items:
+            msg += f"  • {i['name']} → {i['qty']} {i['uom']}\n"
+    msg += "\n✅ Reply *CONFIRM* to apply these changes, or let me know if I misunderstood."
+    return msg
+
+async def handle_cancel_order(analysis: Dict, sender_name: str, chat_id: str) -> str:
+    if analysis.get("suggested_reply"):
+        return analysis["suggested_reply"]
+    order_num = analysis.get("order_number")
+    if order_num:
+        return (
+            f"I understand you'd like to cancel order *{order_num}*, {sender_name}. ❌\n\n"
+            f"To confirm cancellation, please reply *CANCEL {order_num}*.\n\n"
+            f"⚠️ Note: Orders that are already packed or dispatched may not be cancellable."
+        )
+    return (
+        f"I understand you'd like to cancel an order, {sender_name}. ❌\n\n"
+        f"Could you please provide your *order number*? (e.g. B2B-22082025-001)\n"
+        f"You can find it in your order confirmation message."
+    )
+
+async def handle_order_status(analysis: Dict, sender_name: str, chat_id: str) -> str:
+    if analysis.get("suggested_reply"):
+        return analysis["suggested_reply"]
+    order_num = analysis.get("order_number")
+
+    if order_num:
+        # Try to fetch from SNC
+        today = datetime.now().strftime("%d-%m-%Y")
+        thirty_ago = (datetime.now() - timedelta(days=30)).strftime("%d-%m-%Y")
+        result = await snc_call("/b2b/orders/get", {"data": {"include_orders": True, "filter_by": {
+            "source": "B2B", "platform": "Whatsapp", "store_id": [], "branch_id": [],
+            "status": "All", "date_range": [thirty_ago, today],
+            "search_on": ["order_number"], "search_text": order_num,
+            "exact_match": True, "pagination": {"page_no": 1, "no_of_recs": 5, "sort_by": "order_cts", "order_by": False},
+            "whatsapp_contact_id": [],
+        }}})
+        if result and result.get("result", {}).get("data"):
+            orders = result["result"]["data"]
+            o = orders[0]
+            status = o.get("order_status", "Unknown")
+            total = o.get("total_amount", 0)
+            delivery = o.get("delivery_date", "TBD")
+            return (
+                f"📦 Order *{order_num}* status:\n\n"
+                f"• Status: *{status}*\n"
+                f"• Total: ${total:.2f}\n"
+                f"• Delivery Date: {delivery}\n\n"
+                f"Contact your sales rep if you need further assistance."
+            )
+
+    # Fetch recent orders for this chat
+    today = datetime.now().strftime("%d-%m-%Y")
+    thirty_ago = (datetime.now() - timedelta(days=30)).strftime("%d-%m-%Y")
+    result = await snc_call("/b2b/orders/get", {"data": {"include_orders": True, "filter_by": {
+        "source": "B2B", "platform": "Whatsapp", "store_id": [], "branch_id": [],
+        "status": "All", "date_range": [thirty_ago, today],
+        "search_on": ["order_number"], "search_text": "",
+        "exact_match": False, "pagination": {"page_no": 1, "no_of_recs": 5, "sort_by": "order_cts", "order_by": False},
+        "whatsapp_contact_id": [chat_id],
+    }}})
+    if result and result.get("result", {}).get("data"):
+        lines = [f"📦 Your recent orders, {sender_name}:\n"]
+        for o in result["result"]["data"][:5]:
+            lines.append(f"• *{o.get('order_number','—')}* | {o.get('order_status','?')} | ${o.get('total_amount',0):.2f} | {o.get('delivery_date','')}")
+        return "\n".join(lines)
+
+    return (
+        f"I couldn't find recent orders for your account, {sender_name}. 📦\n\n"
+        f"Please share your *order number* (e.g. B2B-22082025-001) and I'll look it up!"
+    )
+
+async def handle_enquiry(analysis: Dict, sender_name: str, chat_id: str) -> str:
+    if analysis.get("suggested_reply"):
+        return analysis["suggested_reply"]
+    return (
+        f"Thanks for your enquiry, {sender_name}! 💬\n\n"
+        f"I'm checking on that for you. For immediate assistance:\n"
+        f"• Type *products* to browse our catalogue\n"
+        f"• Contact your sales rep for pricing & availability\n\n"
+        f"Is there anything specific you'd like to know?"
+    )
+
+async def handle_greeting(analysis: Dict, sender_name: str, customer_name: Optional[str]) -> str:
+    if analysis.get("suggested_reply"):
+        return analysis["suggested_reply"]
+    msg = f"Hi {sender_name}! 👋 Welcome to oneaether ordering."
+    if customer_name:
+        msg += f" Great to hear from *{customer_name}*!"
+    msg += (
+        "\n\nHow can I help you today?\n"
+        "🛒 *New order* — place an order\n"
+        "✏️ *Amend order* — change an existing order\n"
+        "❌ *Cancel order* — cancel an order\n"
+        "📦 *Order status* — check your order\n"
+        "💬 *Enquiry* — product or price info\n\n"
+        "_Just type naturally — I'll understand!_"
+    )
+    return msg
+
+# ─── Main AI Agent ────────────────────────────────────────────────────────────
+
+async def process_incoming_message(
+    message: Dict,
+    contact: Dict,
+    company_id: str,
+    chat_id: str,
+) -> str:
+    """
+    Main AI agent entry point.
+    Detects intent → routes to appropriate handler → returns reply.
+    """
+    # Skip if agent disabled
+    if not credentials["agent"]["enabled"]:
+        return None  # type: ignore
+
+    text = ""
+    if message.get("type") == "text":
+        text = message.get("text", {}).get("body", "").strip()
+    elif message.get("type") in ("image", "document"):
+        text = message.get(message["type"], {}).get("caption", "") or f"[{message['type']} received]"
+    elif message.get("type") in ("audio", "voice"):
+        text = "[Voice message received - please type your order for processing]"
+
+    if not text:
+        return None  # type: ignore
+
+    sender_name  = message.get("from_name") or contact.get("name") or "there"
+    snc_customers = contact.get("customers", [])
+    customer_name = snc_customers[0]["customer_name"] if snc_customers else None
+
+    # Get conversation context
+    context = conversation_memory.get(chat_id, [])
+
+    # Analyze intent
+    logger.info(f"[AGENT] Analyzing: '{text[:80]}' from {sender_name}")
+    analysis = await analyze_with_ai(text, sender_name, customer_name, context)
+    intent = analysis.get("intent", "UNKNOWN")
+    confidence = analysis.get("confidence", 0)
+    logger.info(f"[AGENT] Intent: {intent} ({confidence:.0%}) via {analysis.get('method','?')}")
+
+    # Store in conversation memory (keep last 6 turns)
+    context.append({"role": "customer", "text": text})
+    conversation_memory[chat_id] = context[-6:]
+
+    # Route to handler
+    intent_config = INTENTS.get(intent, {})
+    emoji = intent_config.get("emoji", "💬")
+    label = intent_config.get("label", intent)
+
+    if intent == "NEW_ORDER":
+        reply = await handle_new_order(analysis, sender_name, chat_id)
+    elif intent == "AMEND_ORDER":
+        reply = await handle_amend_order(analysis, sender_name, chat_id)
+    elif intent == "CANCEL_ORDER":
+        reply = await handle_cancel_order(analysis, sender_name, chat_id)
+    elif intent == "ORDER_STATUS":
+        reply = await handle_order_status(analysis, sender_name, chat_id)
+    elif intent == "ENQUIRY":
+        reply = await handle_enquiry(analysis, sender_name, chat_id)
+    elif intent == "GREETING":
+        reply = await handle_greeting(analysis, sender_name, customer_name)
+    else:
+        reply = (
+            f"Thanks for your message, {sender_name}! 🙏\n\n"
+            "I'm your ordering assistant. You can:\n"
+            "🛒 Place a new order\n✏️ Amend an order\n❌ Cancel an order\n📦 Check order status\n💬 Make an enquiry\n\n"
+            "_Just type naturally and I'll understand!_"
+        )
+
+    # Store reply in context
+    conversation_memory[chat_id].append({"role": "agent", "text": reply})
+
+    # Log intent for analytics
+    logger.info(f"[AGENT] {emoji} {label} | {sender_name} | confidence={confidence:.0%} | method={analysis.get('method')}")
+
+    return reply
+
+# ─── Routes ──────────────────────────────────────────────────────────────────
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_frontend():
+    html_file = Path(__file__).parent / "oneaether.html"
+    if html_file.exists():
+        return HTMLResponse(content=html_file.read_text())
+    return HTMLResponse(content="<h2 style='font-family:sans-serif;padding:40px'>✓ oneaether.ai backend running!</h2>")
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "timestamp": datetime.utcnow().isoformat(),
+        "snc_configured":   bool(credentials["snc"].get("access_token")),
+        "whapi_configured": bool(credentials["whapi"].get("token")),
+        "agent_enabled":    credentials["agent"]["enabled"],
+        "ai_model": (
+            "claude-haiku" if credentials["agent"]["anthropic_key"]
+            else "gpt-4o-mini" if credentials["agent"]["openai_key"]
+            else "rule-based"
+        ),
     }
-  };
 
-  return (
-    <>
-      <style>{css}</style>
-      <div className="app">
-        <div className="sidebar">
-          <div className="logo">
-            <div className="logo-mark">one<span>aether</span>.ai</div>
-            <div className="logo-sub">AI Business Platform</div>
-          </div>
-          <div className="nav">
-            {NAV.map(s=>(
-              <div key={s.section}>
-                <div className="nav-section">{s.section}</div>
-                {s.items.map(item=>(
-                  <div key={item.id} className={`nav-item${screen===item.id?" active":""}`} onClick={()=>setScreen(item.id)}>
-                    <span style={{fontSize:14}}>{item.icon}</span>
-                    {item.label}
-                    {item.isNew&&<span style={{marginLeft:"auto",background:"#7c4dff",color:"white",fontSize:9,fontWeight:700,padding:"1px 6px",borderRadius:10}}>NEW</span>}
-                    {item.badge&&<span className="nav-badge">{item.badge}</span>}
-                  </div>
-                ))}
-              </div>
-            ))}
-          </div>
-          <div className="sidebar-footer">
-            <div className="user-chip">
-              <div className="user-av">OA</div>
-              <div><div style={{fontSize:12,fontWeight:600}}>Admin</div><div style={{fontSize:10,color:"var(--text2)"}}>oneaether.ai</div></div>
-            </div>
-          </div>
-        </div>
-        <div className="main">
-          <div className="topbar">
-            <div>
-              <div className="topbar-title">{meta.title}</div>
-              <div className="topbar-sub">{meta.sub}</div>
-            </div>
-            <div className="topbar-right">
-              {screen==="segments"&&<div style={{fontSize:12,color:"#a78bfa"}}>✦ Drag cards to reassign · Use AI tab for smart recommendations</div>}
-              {screen==="whatsapp"&&conn.wapiOk&&<div style={{display:"flex",alignItems:"center",gap:6,fontSize:12,color:"var(--accent)"}}><div style={{width:7,height:7,borderRadius:"50%",background:"var(--accent)",animation:"pulse 2s infinite"}}/>Live · {conn.wapiChannelId}</div>}
-            </div>
-          </div>
-          {render()}
-        </div>
-      </div>
-    </>
-  );
-}
+@app.get("/agent/status")
+async def agent_status():
+    return {
+        "enabled":       credentials["agent"]["enabled"],
+        "ai_powered":    bool(credentials["agent"]["anthropic_key"]),
+        "model": (
+            "claude-haiku-4-5" if credentials["agent"]["anthropic_key"]
+            else "gpt-4o-mini" if credentials["agent"]["openai_key"]
+            else "rule-based"
+        ),
+        "active_chats":  len(conversation_memory),
+        "intents":       list(INTENTS.keys()),
+    }
+
+@app.post("/agent/toggle")
+async def toggle_agent(request: Request):
+    body = await request.json()
+    credentials["agent"]["enabled"] = body.get("enabled", True)
+    status = "ENABLED" if credentials["agent"]["enabled"] else "DISABLED"
+    logger.info(f"AI Agent {status}")
+    return {"enabled": credentials["agent"]["enabled"], "status": status}
+
+@app.post("/agent/test")
+async def test_agent(request: Request):
+    """Test the AI agent with a sample message without sending WhatsApp reply."""
+    body = await request.json()
+    text = body.get("message", "I want to order 5 boxes of chicken karaage")
+    sender = body.get("sender", "Test User")
+
+    analysis = await analyze_with_ai(text, sender, None, [])
+    intent = analysis.get("intent", "UNKNOWN")
+
+    # Generate reply
+    fake_message = {"type": "text", "text": {"body": text}, "from_name": sender, "from": "test", "chat_id": "test"}
+    reply = await process_incoming_message(fake_message, {}, "test", "test_chat")
+
+    return {
+        "input": text,
+        "intent": intent,
+        "confidence": analysis.get("confidence"),
+        "items": analysis.get("items", []),
+        "order_number": analysis.get("order_number"),
+        "summary": analysis.get("summary"),
+        "method": analysis.get("method"),
+        "reply": reply,
+    }
+
+@app.post("/credentials")
+async def save_credentials(payload: CredentialsPayload):
+    if payload.snc:
+        credentials["snc"].update({k: v for k, v in payload.snc.items() if v})
+    if payload.whapi:
+        credentials["whapi"].update({k: v for k, v in payload.whapi.items() if v})
+    if payload.agent:
+        if "enabled" in payload.agent:
+            credentials["agent"]["enabled"] = payload.agent["enabled"] == "true"
+        if "anthropic_key" in payload.agent and payload.agent["anthropic_key"]:
+            credentials["agent"]["anthropic_key"] = payload.agent["anthropic_key"]
+        if "openai_key" in payload.agent and payload.agent["openai_key"]:
+            credentials["agent"]["openai_key"] = payload.agent["openai_key"]
+    return {"status": "ok"}
+
+@app.get("/credentials/status")
+async def credentials_status():
+    return {
+        "snc":   {"api_url": credentials["snc"].get("api_url",""), "company_id": credentials["snc"].get("company_id",""), "authenticated": bool(credentials["snc"].get("access_token"))},
+        "whapi": {"base_url": credentials["whapi"].get("base_url",""), "channel_id": credentials["whapi"].get("channel_id",""), "configured": bool(credentials["whapi"].get("token"))},
+        "agent": {"enabled": credentials["agent"]["enabled"], "ai_powered": bool(credentials["agent"]["anthropic_key"] or credentials["agent"]["openai_key"])},
+    }
+
+@app.post("/process-message")
+async def process_message(request: Request, background_tasks: BackgroundTasks):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    messages   = body.get("messages", [])
+    contact    = body.get("contacts", {})
+    company_id = body.get("company_id", credentials["snc"].get("company_id", ""))
+
+    logger.info(f"Webhook: {len(messages)} messages, company={company_id}")
+
+    for message in messages:
+        if message.get("from_me"):
+            continue
+        if message.get("type") not in ("text", "image", "document", "audio", "voice"):
+            continue
+        background_tasks.add_task(
+            handle_message_background,
+            message=message, contact=contact,
+            company_id=company_id, chat_id=message.get("chat_id", ""),
+        )
+
+    return JSONResponse({"status": "ok", "received": len(messages)})
+
+async def handle_message_background(message: Dict, contact: Dict, company_id: str, chat_id: str):
+    try:
+        reply = await process_incoming_message(
+            message=message, contact=contact,
+            company_id=company_id, chat_id=chat_id,
+        )
+        if reply:
+            sender_phone = message.get("from", "")
+            await send_whatsapp_reply(
+                contact_id=chat_id,
+                message=reply,
+                phone_number=sender_phone if not chat_id.endswith("@g.us") else None,
+            )
+    except Exception as e:
+        logger.error(f"handle_message error: {e}", exc_info=True)
+
+# ─── Proxy Routes ─────────────────────────────────────────────────────────────
+
+@app.get("/proxy/whapi/chats")
+async def proxy_whapi_chats(page: int = 1, count: int = 20):
+    base = credentials["whapi"].get("base_url", "https://gate.whapi.cloud")
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            resp = await client.get(f"{base}/chats", headers=whapi_headers(), params={"page": page, "count": count})
+            return resp.json()
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=str(e))
+
+@app.get("/proxy/whapi/messages/{chat_id}")
+async def proxy_whapi_messages(chat_id: str, page: int = 1, count: int = 40):
+    base = credentials["whapi"].get("base_url", "https://gate.whapi.cloud")
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            resp = await client.get(f"{base}/messages/list/{chat_id}", headers=whapi_headers(), params={"page": page, "count": count})
+            return resp.json()
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=str(e))
+
+@app.post("/proxy/whapi/send")
+async def proxy_whapi_send(payload: SendMessagePayload):
+    success = await send_whatsapp_reply(contact_id=payload.contact_id, message=payload.body, phone_number=payload.phone_number)
+    if not success:
+        raise HTTPException(status_code=502, detail="Failed to send message")
+    return {"status": "ok", "sent": True}
+
+@app.get("/proxy/snc/test-login")
+async def test_login_format(request: Request):
+    """Debug endpoint — shows exactly what we send to SNC."""
+    api_url = credentials["snc"].get("api_url") or "https://enterprise.sellnchill.com/api"
+    return {
+        "login_url":    f"{api_url}/login",
+        "method":       "POST",
+        "body_format":  "multipart/form-data",
+        "fields":       ["username", "password", "grant_type=password", "notification=false"],
+        "snc_api_url":  api_url,
+        "has_token":    bool(credentials["snc"].get("access_token")),
+    }
+
+@app.post("/proxy/snc/login")
+async def proxy_snc_login(request: Request):
+    """
+    Proxy the SNC login — fixes CORS and 405 issues when browser calls SNC directly.
+    """
+    body     = await request.json()
+    api_url  = body.get("api_url", "")
+    username = body.get("username", "")
+    password = body.get("password", "")
+
+    if not api_url or not username or not password:
+        raise HTTPException(status_code=400, detail="api_url, username and password required")
+
+    # Clean URL
+    api_url = api_url.rstrip("/")
+    if not api_url.endswith("/api"):
+        if "/api/" in api_url:
+            api_url = api_url.split("/api/")[0] + "/api"
+        else:
+            api_url = api_url + "/api"
+
+    login_url = f"{api_url}/login"
+    logger.info(f"Proxying SNC login → {login_url}")
+
+    fd = {"username": username, "password": password, "grant_type": "password", "notification": "false"}
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            # Try 1: form data (standard OAuth2)
+            resp = await client.post(login_url, data=fd)
+            logger.info(f"SNC login attempt 1 (form): {resp.status_code}")
+            logger.info(f"SNC response body: {resp.text[:500]}")
+
+            # Try 2: if 500, try JSON body instead
+            if resp.status_code == 500:
+                logger.info("Form data got 500 — trying JSON body")
+                resp = await client.post(login_url,
+                    json={"username": username, "password": password, "grant_type": "password"},
+                    headers={"Content-Type": "application/json"})
+                logger.info(f"SNC login attempt 2 (json): {resp.status_code}")
+                logger.info(f"SNC response body: {resp.text[:500]}")
+
+            # Try 3: if still failing, try without grant_type
+            if resp.status_code in (400, 422, 500):
+                logger.info("Trying without grant_type")
+                resp = await client.post(login_url,
+                    data={"username": username, "password": password})
+                logger.info(f"SNC login attempt 3 (minimal): {resp.status_code}")
+                logger.info(f"SNC response body: {resp.text[:500]}")
+
+            try:
+                data = resp.json()
+            except Exception:
+                data = {"raw": resp.text}
+
+            logger.info(f"SNC final status={resp.status_code} has_token={bool(data.get('access_token'))}")
+
+            if resp.status_code not in (200, 201):
+                detail = data.get("detail") or data.get("message") or data.get("error") or f"SNC returned {resp.status_code}: {resp.text[:200]}"
+                raise HTTPException(status_code=resp.status_code, detail=detail)
+
+            if data.get("access_token"):
+                credentials["snc"]["api_url"]     = api_url
+                credentials["snc"]["access_token"] = data["access_token"]
+                credentials["snc"]["user_id"]      = data.get("user_id", "")
+                credentials["snc"]["username"]     = username
+            return data
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"SNC login proxy error: {e}")
+        raise HTTPException(status_code=502, detail=str(e))
 
 
-// Mount the app
-const root = ReactDOM.createRoot(document.getElementById("root"));
-root.render(<App />);
-</script>
-</body>
-</html>
+@app.post("/proxy/snc/customers")
+async def proxy_snc_customers(request: Request):
+    body = await request.json()
+    result = await snc_call("/customers/get", {"data": {"filter_by": {"search_on": ["customer_id","customer_name","customer_phone","customer_email"], "exact_match": False, "pagination": {"page_no":1,"no_of_recs":40,"sort_by":"cts","order_by":False}, **body.get("filter_by", {})}}})
+    if result is None:
+        raise HTTPException(status_code=502, detail="SNC API call failed")
+    return result
+
+@app.post("/proxy/snc/products")
+async def proxy_snc_products(request: Request):
+    body = await request.json()
+    search_text = body.get("search_text", [])
+    result = await snc_call("/products/list", {"data": {"filter_by": {"search_text": search_text if isinstance(search_text, list) else [search_text], "search_on": ["name","sku","product_code"], "confidence": 0.5, "exact_match": False, "pagination": {"page_no":1,"no_of_recs":40,"sort_by":"cts","order_by":False}, "view":"individual","status":"All","include_columns":["name","sku","prices","uom","quantity","images"],"merged":True,"bundles":False}}})
+    if result is None:
+        raise HTTPException(status_code=502, detail="SNC API call failed")
+    return result
+
+@app.post("/proxy/snc/orders")
+async def proxy_snc_orders(request: Request):
+    body = await request.json()
+    date_range = body.get("date_range", [])
+    if not date_range:
+        today = datetime.now().strftime("%d-%m-%Y")
+        thirty_ago = (datetime.now() - timedelta(days=30)).strftime("%d-%m-%Y")
+        date_range = [thirty_ago, today]
+    result = await snc_call("/b2b/orders/get", {"data": {"include_orders": True, "filter_by": {"source":"B2B","platform":"Whatsapp","store_id":[],"branch_id":[],"status":body.get("status","All"),"date_range":date_range,"search_on":["order_number","reference","store","tags"],"search_text":"","exact_match":False,"pagination":{"page_no":1,"no_of_recs":40,"sort_by":"order_cts","order_by":False},"whatsapp_contact_id":body.get("whatsapp_contact_id",[]),"review_required":False}}})
+    if result is None:
+        raise HTTPException(status_code=502, detail="SNC API call failed")
+    return result
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False, log_level="info")
