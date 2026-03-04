@@ -605,10 +605,23 @@ def build_reply(analysis: Dict, sender: str) -> str:
 async def process_incoming_message(message: Dict, contact: Dict, company_id: str, chat_id: str):
     if not credentials["agent"]["enabled"]: return
     text = ""
-    if message.get("type") == "text":
-        text = (message.get("text") or {}).get("body","").strip()
-    elif message.get("type") in ("image","document"):
-        text = (message.get(message["type"]) or {}).get("caption","") or f"[{message['type']} received]"
+    msg_type = message.get("type","")
+    if msg_type == "text":
+        txt_field = message.get("text","")
+        if isinstance(txt_field, dict):
+            text = txt_field.get("body","").strip()
+        elif isinstance(txt_field, str):
+            text = txt_field.strip()
+        # Some Whapi formats send body at top level
+        if not text:
+            text = message.get("body","").strip()
+    elif msg_type in ("image","document"):
+        media = message.get(msg_type) or {}
+        if isinstance(media, dict):
+            text = media.get("caption","") or f"[{msg_type} received]"
+        else:
+            text = f"[{msg_type} received]"
+    logger.info("[AGENT] Received type=%s text=%r from chat=%s", msg_type, text[:80] if text else "", message.get("chat_id",""))
     if not text: return
 
     sender = message.get("from_name") or contact.get("name") or "there"
@@ -959,6 +972,48 @@ async def proxy_snc_orders(request: Request):
     }}})
     if result is None: raise HTTPException(status_code=502, detail="SNC API failed")
     return result
+
+@app.post("/orders/create")
+async def create_order_manual(request: Request):
+    """Create order manually from the UI Create Order button."""
+    body          = await request.json()
+    chat_id       = body.get("chat_id", "")
+    items_raw     = body.get("items", [])
+    delivery_date = body.get("delivery_date", "")
+    sender_name   = body.get("sender_name", "")
+
+    if not items_raw:
+        raise HTTPException(status_code=400, detail="No items provided")
+
+    # Convert raw items to lookup format
+    items = [{"name": i["name"], "qty": i.get("qty",1), "uom": i.get("uom","unit")} for i in items_raw if i.get("name","").strip()]
+
+    # Look up products in SNC
+    enriched = await lookup_products_for_items(items)
+    found    = [i for i in enriched if i.get("found")]
+
+    if not found:
+        names = ", ".join(i["name"] for i in items)
+        raise HTTPException(status_code=404, detail=f"Products not found in SNC catalogue: {names}")
+
+    # Create order
+    order_num = await push_order_to_snc(
+        items=found,
+        chat_id=chat_id,
+        delivery_date=delivery_date,
+        sender_name=sender_name,
+    )
+
+    if not order_num:
+        raise HTTPException(status_code=502, detail="Order creation failed — check SNC credentials and customer assignment")
+
+    # Send WhatsApp confirmation
+    item_lines = ", ".join([f"{i['full_name']} x{i['qty']}" for i in found])
+    msg = f"✅ Order *{order_num}* placed!\n📦 {item_lines}\n📅 Delivery: {delivery_date or 'as scheduled'}"
+    await whapi_send(chat_id, msg)
+
+    return {"order_number": order_num, "items": len(found), "status": "created"}
+
 
 @app.get("/agent/status")
 async def agent_status():
