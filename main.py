@@ -763,6 +763,27 @@ async def serve_frontend():
     if html_file.exists(): return HTMLResponse(content=html_file.read_text())
     return HTMLResponse(content="<h2>✓ oneaether.ai running</h2>")
 
+@app.get("/debug/order-test/{chat_id:path}")
+async def debug_order_test(chat_id: str):
+    """Test all prerequisites for order creation."""
+    assignment = db_get_assignment(chat_id) or {}
+    db = get_db()
+    cust_count = db.execute("SELECT COUNT(*) FROM customers").fetchone()[0]
+    prod_count = db.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+    db.close()
+    return {
+        "chat_id":        chat_id,
+        "assignment":     assignment,
+        "snc_token":      bool(credentials["snc"].get("access_token")),
+        "snc_user_id":    credentials["snc"].get("user_id","") or "1qxcb0ssTRGPQaKogvtkMw (fallback)",
+        "snc_company_id": credentials["snc"].get("company_id",""),
+        "snc_api_url":    credentials["snc"].get("api_url",""),
+        "db_customers":   cust_count,
+        "db_products":    prod_count,
+        "ready":          bool(assignment.get("customer_id") or assignment.get("store_id")),
+    }
+
+
 @app.get("/resolve-user")
 async def resolve_user():
     """Fetch user_id from SNC using the current token — call this after setting token."""
