@@ -841,157 +841,282 @@ function DashboardScreen({ conn = {} }) {
 }
 
 function CustomersScreen({ conn = {} }) {
-  const [customers, setCustomers] = useState([]);
-  const [total, setTotal]         = useState(0);
-  const [page, setPage]           = useState(1);
-  const [search, setSearch]       = useState("");
-  const [loading, setLoading]     = useState(false);
-  const [syncing, setSyncing]     = useState(false);
-  const [lastSync, setLastSync]   = useState(null);
-  const [error, setError]         = useState("");
-  const agentUrl = conn.agentUrl || window.AGENT_URL || "";
-  const PER_PAGE = 50;
+  const [customers, setCustomers]     = useState([]);
+  const [total, setTotal]             = useState(0);
+  const [page, setPage]               = useState(1);
+  const [search, setSearch]           = useState("");
+  const [syncing, setSyncing]         = useState(false);
+  const [lastSync, setLastSync]       = useState("");
+  const [selected, setSelected]       = useState(null);
+  const [orders, setOrders]           = useState([]);
+  const [ordersLoading, setOrdersLoading] = useState(false);
+  const PER_PAGE = 20;
 
-  const fetchCustomers = async (p = 1, q = search) => {
+  const agentUrl = conn.agentUrl || window.AGENT_URL || "";
+
+  const fetchCustomers = async (p, q) => {
     if (!agentUrl) return;
-    setLoading(true); setError("");
     try {
-      const res = await fetch(`${agentUrl}/data/customers?page=${p}&per_page=${PER_PAGE}&search=${encodeURIComponent(q)}`);
-      if (!res.ok) throw new Error("Failed to fetch");
-      const data = await res.json();
-      setCustomers(data.customers || []);
-      setTotal(data.total || 0);
-      setPage(p);
-    } catch(e) { setError(e.message); }
-    finally { setLoading(false); }
+      const res = await fetch(`${agentUrl}/data/customers?page=${p||page}&per_page=${PER_PAGE}&search=${encodeURIComponent(q!==undefined?q:search)}`);
+      const d = await res.json();
+      setCustomers(d.customers || []);
+      setTotal(d.total || 0);
+    } catch(e) { console.warn("fetch customers:", e); }
+  };
+
+  const fetchOrders = async (customerId) => {
+    setOrdersLoading(true);
+    setOrders([]);
+    try {
+      const res = await fetch(`${agentUrl}/data/customer/${encodeURIComponent(customerId)}/orders?per_page=20`);
+      const d = await res.json();
+      setOrders(d.orders || []);
+    } catch(e) { console.warn("fetch orders:", e); }
+    finally { setOrdersLoading(false); }
   };
 
   const syncFromSNC = async () => {
-    if (!agentUrl) return;
-    setSyncing(true); setError("");
+    if (!agentUrl || syncing) return;
+    setSyncing(true);
     try {
       await fetch(`${agentUrl}/sync/customers`, { method: "POST" });
-      setLastSync(new Date().toLocaleTimeString());
-      // Poll every 2s until customers appear (max 30s)
       let attempts = 0;
-      const poll = async () => {
+      const poll = setInterval(async () => {
         attempts++;
-        await fetchCustomers(1, search);
-        if (customers.length === 0 && attempts < 15) {
-          setTimeout(poll, 2000);
-        } else {
+        const res = await fetch(`${agentUrl}/data/customers?per_page=1`);
+        const d = await res.json();
+        if (d.total > 0 || attempts > 20) {
+          clearInterval(poll);
           setSyncing(false);
+          setLastSync(new Date().toLocaleTimeString());
+          fetchCustomers(1, "");
         }
-      };
-      setTimeout(poll, 2000);
-    } catch(e) {
-      setError("Sync failed: " + e.message);
-      setSyncing(false);
-    }
+      }, 2000);
+    } catch(e) { setSyncing(false); }
   };
 
-  useEffect(() => { fetchCustomers(1, ""); }, [agentUrl]);
+  useState(() => { if(agentUrl) fetchCustomers(1,""); }, [agentUrl]);
 
-  const filtered = customers; // filtering done server-side
+  const openCustomer = (c) => {
+    setSelected(c);
+    fetchOrders(c.customer_id);
+  };
+
+  const statusColor = (s) => {
+    s = (s||"").toLowerCase();
+    if (s === "active") return "#10b981";
+    if (s === "inactive") return "#ef4444";
+    return "#f59e0b";
+  };
+
+  if (selected) {
+    const s = selected;
+    const b2bStores = s.b2b_stores || [];
+    return (
+      <div style={{padding:"0 0 40px"}}>
+        {/* Header */}
+        <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:24}}>
+          <button className="btn btn-ghost" style={{fontSize:13}} onClick={()=>setSelected(null)}>← Back</button>
+          <div style={{flex:1}}>
+            <div style={{fontSize:20,fontWeight:700,color:"var(--text)"}}>{s.customer_name}</div>
+            <div style={{fontSize:12,color:"var(--text2)"}}>ID: {s.customer_id} {s.customer_type ? "· "+s.customer_type : ""}</div>
+          </div>
+          <span style={{padding:"4px 12px",borderRadius:20,fontSize:12,fontWeight:600,
+            background: statusColor(s.status)+"22", color: statusColor(s.status)}}>
+            {s.status||"Active"}
+          </span>
+        </div>
+
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16,marginBottom:20}}>
+          {/* Contact Info */}
+          <div style={{background:"var(--card)",borderRadius:"var(--r2)",padding:16}}>
+            <div style={{fontSize:11,fontWeight:700,color:"var(--text2)",marginBottom:12,letterSpacing:1}}>CONTACT</div>
+            {[
+              ["📞 Phone",    s.phone],
+              ["✉️ Email",    s.email],
+              ["🏢 UEN",      s.uen],
+              ["💳 Billing ID",s.billing_id],
+            ].filter(x=>x[1]).map(([k,v])=>(
+              <div key={k} style={{display:"flex",justifyContent:"space-between",marginBottom:8,fontSize:13}}>
+                <span style={{color:"var(--text2)"}}>{k}</span>
+                <span style={{color:"var(--text)",fontWeight:500}}>{v}</span>
+              </div>
+            ))}
+          </div>
+
+          {/* Financial Info */}
+          <div style={{background:"var(--card)",borderRadius:"var(--r2)",padding:16}}>
+            <div style={{fontSize:11,fontWeight:700,color:"var(--text2)",marginBottom:12,letterSpacing:1}}>FINANCIAL</div>
+            {[
+              ["💰 Credit Term",  s.credit_term],
+              ["🏷️ Price Tier",   s.price_tier],
+              ["💵 Currency",     s.currency],
+              ["🧾 Tax Code",     s.tax_code],
+              ["💳 Payment Mode", s.payment_mode],
+              ["👤 Sales Person", s.sales_person],
+            ].filter(x=>x[1]).map(([k,v])=>(
+              <div key={k} style={{display:"flex",justifyContent:"space-between",marginBottom:8,fontSize:13}}>
+                <span style={{color:"var(--text2)"}}>{k}</span>
+                <span style={{color:"var(--text)",fontWeight:500}}>{v}</span>
+              </div>
+            ))}
+          </div>
+
+          {/* Credit limits */}
+          <div style={{background:"var(--card)",borderRadius:"var(--r2)",padding:16}}>
+            <div style={{fontSize:11,fontWeight:700,color:"var(--text2)",marginBottom:12,letterSpacing:1}}>CREDIT</div>
+            {[
+              ["Outstanding",   s.outstanding_amount != null ? "$"+(s.outstanding_amount||0).toFixed(2) : null],
+              ["Max Limit",     s.max_credit_limit    > 0    ? "$"+(s.max_credit_limit).toFixed(2)    : null],
+              ["Min Order",     s.min_order_amount    > 0    ? "$"+(s.min_order_amount).toFixed(2)    : null],
+            ].filter(x=>x[1]).map(([k,v])=>(
+              <div key={k} style={{display:"flex",justifyContent:"space-between",marginBottom:8,fontSize:13}}>
+                <span style={{color:"var(--text2)"}}>{k}</span>
+                <span style={{color:"var(--text)",fontWeight:600}}>{v}</span>
+              </div>
+            ))}
+          </div>
+
+          {/* Branches */}
+          <div style={{background:"var(--card)",borderRadius:"var(--r2)",padding:16}}>
+            <div style={{fontSize:11,fontWeight:700,color:"var(--text2)",marginBottom:12,letterSpacing:1}}>BRANCHES ({b2bStores.length})</div>
+            {b2bStores.length === 0
+              ? <div style={{fontSize:12,color:"var(--text2)"}}>No branches configured in SNC B2B</div>
+              : b2bStores.map((st,i)=>(
+                <div key={i} style={{marginBottom:8,padding:"6px 10px",background:"var(--bg)",borderRadius:6,fontSize:12}}>
+                  <div style={{fontWeight:600,color:"var(--text)"}}>{st.branch_name||st.store_name||"Branch "+(i+1)}</div>
+                  <div style={{color:"var(--text2)",fontSize:11}}>ID: {st.branch_id||st.store_id||"—"}</div>
+                </div>
+              ))
+            }
+          </div>
+        </div>
+
+        {/* Order History */}
+        <div style={{background:"var(--card)",borderRadius:"var(--r2)",padding:16}}>
+          <div style={{fontSize:11,fontWeight:700,color:"var(--text2)",marginBottom:12,letterSpacing:1}}>ORDER HISTORY</div>
+          {ordersLoading && <div style={{color:"var(--accent)",fontSize:13}}>⏳ Loading orders...</div>}
+          {!ordersLoading && orders.length === 0 && (
+            <div style={{fontSize:13,color:"var(--text2)"}}>No orders found. Orders will sync automatically from SNC.</div>
+          )}
+          {orders.map(o=>(
+            <div key={o.order_id} style={{
+              display:"grid",gridTemplateColumns:"1fr auto auto",gap:12,
+              padding:"10px 0",borderBottom:"1px solid var(--border)",alignItems:"center"
+            }}>
+              <div>
+                <div style={{fontWeight:600,color:"var(--text)",fontSize:13}}>{o.order_number}</div>
+                <div style={{fontSize:11,color:"var(--text2)"}}>
+                  {o.delivery_date} · {(o.item_info||[]).length} items · {o.platform||"B2B"}
+                </div>
+              </div>
+              <div style={{textAlign:"right"}}>
+                <div style={{fontWeight:700,color:"var(--text)",fontSize:14}}>${(o.total_amount||0).toFixed(2)}</div>
+                <div style={{fontSize:11,color:"var(--text2)"}}>${(o.item_total||0).toFixed(2)} + tax</div>
+              </div>
+              <div>
+                <span style={{padding:"3px 10px",borderRadius:20,fontSize:11,fontWeight:600,
+                  background: (o.status||"").toLowerCase()==="pending" ? "#f59e0b22" :
+                              (o.status||"").toLowerCase()==="delivered" ? "#10b98122" : "#6366f122",
+                  color:      (o.status||"").toLowerCase()==="pending" ? "#f59e0b" :
+                              (o.status||"").toLowerCase()==="delivered" ? "#10b981" : "#6366f1"
+                }}>{o.status||"Pending"}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  const totalPages = Math.max(1, Math.ceil(total / PER_PAGE));
 
   return (
-    <div className="content">
-      <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:16,flexWrap:"wrap"}}>
-        <input className="search-input" style={{flex:1,minWidth:200}} placeholder="Search customers..."
-          value={search} onChange={e=>setSearch(e.target.value)}
-          onKeyDown={e=>e.key==="Enter" && fetchCustomers(1,search)}/>
-        <button className="btn btn-ghost btn-sm" onClick={()=>fetchCustomers(1,search)} disabled={loading}>
-          {loading ? "Loading..." : "🔍 Search"}
-        </button>
-        <button className="btn btn-primary btn-sm" onClick={syncFromSNC} disabled={syncing}
-          title="Pull latest customers from SellnChill ERP">
+    <div>
+      <div style={{display:"flex",gap:8,marginBottom:16,alignItems:"center"}}>
+        <input className="form-input" placeholder="Search customers..." value={search}
+          style={{flex:1}} onChange={e=>setSearch(e.target.value)}
+          onKeyDown={e=>{ if(e.key==="Enter"){setPage(1);fetchCustomers(1,search);} }} />
+        <button className="btn btn-ghost btn-sm" onClick={()=>{setPage(1);fetchCustomers(1,search);}}>🔍 Search</button>
+        <button className="btn btn-primary btn-sm" onClick={syncFromSNC} disabled={syncing}>
           {syncing ? "⏳ Syncing..." : "↻ Sync from SNC"}
         </button>
-        {lastSync && <span style={{fontSize:11,color:"var(--accent)"}}>Last sync: {lastSync}</span>}
+        {lastSync && <span style={{fontSize:11,color:"var(--text2)"}}>Last sync: {lastSync}</span>}
       </div>
 
-      {error && <div style={{background:"#ef444420",border:"1px solid #ef444440",borderRadius:"var(--r2)",padding:"10px 14px",color:"#ef4444",fontSize:12,marginBottom:12}}>{error}</div>}
-
       {syncing && (
-        <div style={{background:"#f59e0b15",border:"1px solid #f59e0b30",borderRadius:"var(--r2)",padding:"10px 14px",color:"var(--warn)",fontSize:12,marginBottom:12}}>
-          ⏳ Syncing customers from SellnChill... This may take a moment. Results will appear automatically.
+        <div style={{background:"#f59e0b15",border:"1px solid #f59e0b30",borderRadius:"var(--r2)",
+          padding:"10px 16px",marginBottom:12,fontSize:13,color:"var(--warn)"}}>
+          ⏳ Syncing customers from SellnChill... This may take a moment.
         </div>
       )}
 
-      <div className="card" style={{padding:0,overflow:"hidden"}}>
-        <div style={{padding:"12px 16px",borderBottom:"1px solid var(--border)",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
-          <div style={{fontWeight:700,fontSize:13}}>Customers <span style={{color:"var(--text2)",fontWeight:400}}>({total} total)</span></div>
-          <div style={{fontSize:11,color:"var(--text2)"}}>
-            {customers.length > 0 ? `Showing ${(page-1)*PER_PAGE+1}–${Math.min(page*PER_PAGE,total)} of ${total}` : ""}
-          </div>
+      {customers.length === 0 && !syncing && (
+        <div style={{textAlign:"center",padding:40}}>
+          <div style={{fontSize:40,marginBottom:12}}>👥</div>
+          <div style={{fontWeight:600,color:"var(--text)",marginBottom:6}}>No customers yet</div>
+          <div style={{fontSize:13,color:"var(--text2)",marginBottom:16}}>Click ↻ Sync from SNC to pull your customers from SellnChill ERP</div>
+          <button className="btn btn-primary" onClick={syncFromSNC}>↻ Sync from SNC</button>
         </div>
+      )}
 
-        {customers.length === 0 && !loading && (
-          <div style={{padding:40,textAlign:"center",color:"var(--text2)"}}>
-            {agentUrl ? (
-              <>
-                <div style={{fontSize:32,marginBottom:12}}>👥</div>
-                <div style={{fontWeight:600,marginBottom:8}}>No customers yet</div>
-                <div style={{fontSize:12,marginBottom:16}}>Click <strong>↻ Sync from SNC</strong> to pull your customers from SellnChill ERP</div>
-                <button className="btn btn-primary" onClick={syncFromSNC} disabled={syncing}>
-                  {syncing ? "Syncing..." : "↻ Sync Now"}
-                </button>
-              </>
-            ) : (
-              <div>Connect your backend first to load customers</div>
-            )}
+      {customers.length > 0 && (
+        <>
+          <div style={{fontSize:12,color:"var(--text2)",marginBottom:10}}>
+            Showing {customers.length} of {total} customers · Click any row to view details & order history
           </div>
-        )}
-
-        {customers.length > 0 && (
-          <table>
-            <thead>
-              <tr>
-                <th>Customer</th>
-                <th>Phone</th>
-                <th>Email</th>
-                <th>Branch</th>
-                <th>Credit Term</th>
-                <th>Status</th>
-                <th>Last Synced</th>
-              </tr>
-            </thead>
-            <tbody>
-              {(customers||[]).map((c,i) => (
-                <tr key={c.customer_id || i}>
-                  <td><div style={{fontWeight:600}}>{c.customer_name || "—"}</div>
-                    <div style={{fontSize:10,color:"var(--text2)"}}>{c.store || c.customer_id}</div>
-                  </td>
-                  <td>{c.phone || "—"}</td>
-                  <td style={{fontSize:11}}>{c.email || "—"}</td>
-                  <td>{c.branch_name || "—"}</td>
-                  <td>{c.credit_term || "—"}</td>
-                  <td>
-                    <span style={{
-                      padding:"2px 8px",borderRadius:20,fontSize:10,fontWeight:700,
-                      background: c.status==="Active" ? "#00d9a320" : "#ef444420",
-                      color:      c.status==="Active" ? "var(--accent)"  : "#ef4444",
-                    }}>{c.status || "Active"}</span>
-                  </td>
-                  <td style={{fontSize:10,color:"var(--text2)"}}>{c.synced_at ? c.synced_at.split("T")[0] : "—"}</td>
+          <div style={{background:"var(--card)",borderRadius:"var(--r2)",overflow:"hidden"}}>
+            <table style={{width:"100%",borderCollapse:"collapse"}}>
+              <thead>
+                <tr style={{background:"var(--bg)"}}>
+                  {["Customer","ID","Phone","Email","Branch","Credit Term","Price Tier","Outstanding","Status"].map(h=>(
+                    <th key={h} style={{padding:"10px 14px",textAlign:"left",fontSize:11,
+                      fontWeight:700,color:"var(--text2)",letterSpacing:0.5,whiteSpace:"nowrap"}}>{h}</th>
+                  ))}
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </div>
-
-      {/* Pagination */}
-      {total > PER_PAGE && (
-        <div style={{display:"flex",justifyContent:"center",gap:8,marginTop:16}}>
-          <button className="btn btn-ghost btn-sm" disabled={page===1} onClick={()=>fetchCustomers(page-1,search)}>← Prev</button>
-          <span style={{padding:"4px 12px",fontSize:12,color:"var(--text2)"}}>Page {page} of {Math.ceil(total/PER_PAGE)}</span>
-          <button className="btn btn-ghost btn-sm" disabled={page*PER_PAGE>=total} onClick={()=>fetchCustomers(page+1,search)}>Next →</button>
-        </div>
+              </thead>
+              <tbody>
+                {customers.map((c,i)=>(
+                  <tr key={c.customer_id} onClick={()=>openCustomer(c)}
+                    style={{borderTop:"1px solid var(--border)",cursor:"pointer",
+                      background: i%2===0?"transparent":"var(--bg)"}}
+                    onMouseEnter={e=>e.currentTarget.style.background="var(--hover)"}
+                    onMouseLeave={e=>e.currentTarget.style.background=i%2===0?"transparent":"var(--bg)"}>
+                    <td style={{padding:"10px 14px",fontWeight:600,color:"var(--text)",fontSize:13}}>{c.customer_name}</td>
+                    <td style={{padding:"10px 14px",fontSize:12,color:"var(--text2)"}}>{c.customer_id}</td>
+                    <td style={{padding:"10px 14px",fontSize:12,color:"var(--text2)"}}>{c.phone||"—"}</td>
+                    <td style={{padding:"10px 14px",fontSize:12,color:"var(--text2)",maxWidth:140,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{c.email||"—"}</td>
+                    <td style={{padding:"10px 14px",fontSize:12,color:"var(--text2)"}}>{c.branch_name||"—"}</td>
+                    <td style={{padding:"10px 14px",fontSize:12,color:"var(--text2)"}}>{c.credit_term||"—"}</td>
+                    <td style={{padding:"10px 14px",fontSize:12,color:"var(--text2)"}}>{c.price_tier||"—"}</td>
+                    <td style={{padding:"10px 14px",fontSize:12,fontWeight:600,
+                      color:(c.outstanding_amount||0)>0?"#ef4444":"var(--text2)"}}>
+                      {(c.outstanding_amount||0)>0?"$"+(c.outstanding_amount).toFixed(2):"—"}
+                    </td>
+                    <td style={{padding:"10px 14px"}}>
+                      <span style={{padding:"3px 10px",borderRadius:20,fontSize:11,fontWeight:600,
+                        background:statusColor(c.status)+"22",color:statusColor(c.status)}}>
+                        {c.status||"Active"}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div style={{display:"flex",justifyContent:"center",gap:8,marginTop:12,alignItems:"center"}}>
+            <button className="btn btn-ghost btn-sm" disabled={page<=1}
+              onClick={()=>{const p=page-1;setPage(p);fetchCustomers(p,search);}}>← Prev</button>
+            <span style={{fontSize:12,color:"var(--text2)"}}>Page {page} of {totalPages}</span>
+            <button className="btn btn-ghost btn-sm" disabled={page>=totalPages}
+              onClick={()=>{const p=page+1;setPage(p);fetchCustomers(p,search);}}>Next →</button>
+          </div>
+        </>
       )}
     </div>
   );
 }
+
 
 
 function ProductsScreen() {
