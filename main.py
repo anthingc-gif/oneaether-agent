@@ -115,6 +115,42 @@ def db_set_credential(key: str, value: str):
     db.execute("INSERT OR REPLACE INTO credentials(key,value,uts) VALUES(?,?,datetime('now'))", (key, value))
     db.commit(); db.close()
 
+# Store encrypted SNC credentials for auto-refresh
+# These are the Fernet-encrypted values from the browser/Postman
+SNC_ENC_USERNAME = "gAAAAABoqEPZGYCgChT1WhZBGw27VZsOAPIfR4GuBCjd0YsYl5115GocjXjPKYWEQjZVvbfdL5Ibsf5_7KomKdn5Xqm3A9vmYXIoudeREWERO8-D_1OkoSc="
+SNC_ENC_PASSWORD = "gAAAAABoqEPZbvRypzhBV1omAh9YOWFUjCZJRvJ8Ub2Nnjzv0jCMDFWrZNiFGPPdRQA6Vs1LbPTIvN-EE_HcXm8UXia5u2w93w=="
+
+async def auto_refresh_token() -> bool:
+    """Login to SNC using stored encrypted credentials to get a fresh token."""
+    api_url = credentials["snc"].get("api_url", "https://enterprise.sellnchill.com/api")
+    enc_user = os.getenv("SNC_ENC_USERNAME", SNC_ENC_USERNAME)
+    enc_pass = os.getenv("SNC_ENC_PASSWORD", SNC_ENC_PASSWORD)
+    logger.info("Auto-refreshing SNC token...")
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post(f"{api_url}/login", data={
+                "username":     enc_user,
+                "password":     enc_pass,
+                "grant_type":   "password",
+                "notification": "false",
+            })
+            logger.info("Auto-login response: HTTP %s", resp.status_code)
+            if resp.status_code in (200, 201):
+                data = resp.json()
+                token = data.get("access_token", "")
+                if token:
+                    credentials["snc"]["access_token"] = token
+                    credentials["snc"]["user_id"]      = data.get("user_id", credentials["snc"].get("user_id",""))
+                    db_set_credential("snc_token",   token)
+                    db_set_credential("snc_user_id", credentials["snc"]["user_id"])
+                    logger.info("Token refreshed! user_id=%s", credentials["snc"]["user_id"])
+                    return True
+            logger.error("Auto-login failed: %s %s", resp.status_code, resp.text[:200])
+            return False
+    except Exception as e:
+        logger.error("Auto-login exception: %s", e)
+        return False
+
 def db_get_credential(key: str) -> Optional[str]:
     db = get_db()
     row = db.execute("SELECT value FROM credentials WHERE key=?", (key,)).fetchone()
@@ -256,11 +292,34 @@ async def lifespan(app: FastAPI):
     init_db()
     load_credentials_from_db()
     logger.info("oneaether.ai starting on port %s", os.getenv("PORT", 8000))
+    # Auto-refresh token on startup
+    if not credentials["snc"].get("access_token"):
+        await auto_refresh_token()
+    else:
+        # Verify token is still valid, refresh if not
+        asyncio.create_task(_verify_and_refresh_token())
     logger.info("Agent: %s | AI: %s",
         "ON" if credentials["agent"]["enabled"] else "OFF",
         "Claude" if credentials["agent"]["anthropic_key"] else
         "OpenAI" if credentials["agent"]["openai_key"] else "rule-based")
     yield
+
+async def _verify_and_refresh_token():
+    """Check if current token is valid, refresh if expired."""
+    api_url = credentials["snc"].get("api_url","")
+    token   = credentials["snc"].get("access_token","")
+    if not api_url or not token:
+        await auto_refresh_token()
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(f"{api_url}/health",
+                headers={"Authorization": f"Bearer {token}"})
+            if resp.status_code == 401:
+                logger.info("Token expired on startup — refreshing")
+                await auto_refresh_token()
+    except Exception:
+        pass
 
 app = FastAPI(title="oneaether.ai", version="1.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
@@ -345,6 +404,20 @@ async def snc_call(endpoint: str, body: Dict) -> Optional[Dict]:
                 headers=snc_headers()
             )
             logger.info("snc_call %s → HTTP %s", endpoint, resp.status_code)
+            if resp.status_code == 401:
+                logger.warning("snc_call %s got 401 — attempting token refresh", endpoint)
+                refreshed = await auto_refresh_token()
+                if refreshed:
+                    # Retry with new token
+                    resp = await client.post(
+                        f"{api_url}{endpoint}",
+                        json={**snc_base(), **body},
+                        headers=snc_headers()
+                    )
+                    logger.info("snc_call %s retry → HTTP %s", endpoint, resp.status_code)
+                else:
+                    logger.error("Token refresh failed — cannot retry")
+                    return None
             if resp.status_code not in (200, 201):
                 logger.error("snc_call %s failed: %s", endpoint, resp.text[:300])
                 return None
@@ -583,34 +656,47 @@ async def lookup_products_for_items(items: List[Dict]) -> List[Dict]:
     return enriched
 
 async def push_order_to_snc(items: List[Dict], chat_id: str, delivery_date: str, sender_name: str) -> Optional[str]:
-    assignment = db_get_assignment(chat_id) or {}
-    store_id   = assignment.get("store_id","")
-    store      = assignment.get("customer","")
-    branch_id  = assignment.get("branch_id","")
-    branch_name= assignment.get("branch","Main Branch")
-    username   = credentials["snc"].get("username","")
-    user_id    = credentials["snc"].get("user_id","")
-    company_id = credentials["snc"].get("company_id","mindmasters")
-    delivery   = delivery_date or (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+    assignment  = db_get_assignment(chat_id) or {}
+    store_id    = assignment.get("store_id","")
+    store       = assignment.get("customer","")
+    branch_id   = assignment.get("branch_id","") or ""
+    branch_name = assignment.get("branch","Main Branch")
+    username    = credentials["snc"].get("username","") or "admin@mindmastersg.com"
+    user_id     = credentials["snc"].get("user_id","") or "1qxcb0ssTRGPQaKogvtkMw"
+    company_id  = credentials["snc"].get("company_id","mindmasters")
+    delivery    = delivery_date or (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # Clean branch_id — "main" is a placeholder, not a real SNC ID
+    if branch_id == "main":
+        branch_id = ""
 
     item_info  = []
     item_total = 0.0
     tax_total  = 0.0
+
     for it in items:
-        if not it.get("found"): continue
-        # Allow empty item_id — SNC may match by SKU/name
-        qty        = it.get("qty",1)
-        price      = it.get("price",0)
-        tax_rate   = it.get("tax_rate",9)
+        qty        = int(it.get("qty", 1) or 1)
+        price      = float(it.get("price", 0) or 0)
+        tax_rate   = float(it.get("tax_rate", 9) or 9)
+        name       = it.get("full_name") or it.get("name") or it.get("sku","Unknown")
+        sku        = it.get("sku") or it.get("name","")
+        item_id    = it.get("item_id","")
+        uom        = it.get("uom","unit")
+        uom_id     = it.get("uom_id","")
+        tax_code   = it.get("tax_code","SR9")
+        tax_code_id= it.get("tax_code_id","")
+
         line_total = round(qty * price, 5)
         tax_amt    = round(line_total * tax_rate / 100, 5)
-        item_total += line_total; tax_total += tax_amt
+        item_total += line_total
+        tax_total  += tax_amt
+
         item_info.append({
-            "item_id": it["item_id"], "name": it["full_name"], "sku": it["sku"],
-            "tax_code": it["tax_code"], "tax_code_id": it["tax_code_id"],
+            "item_id": item_id, "name": name, "sku": sku,
+            "tax_code": tax_code, "tax_code_id": tax_code_id,
             "tax_rate": tax_rate, "tax_amount": tax_amt,
-            "uom": it["uom"], "uom_id": it["uom_id"],
-            "base_uom_id": it["base_uom_id"], "base_uom": it["base_uom"],
+            "uom": uom, "uom_id": uom_id,
+            "base_uom_id": uom_id, "base_uom": uom,
             "conversion_rate": 1, "qty": qty, "new_qty": qty, "actual_qty": qty,
             "total_order_qty": 0, "price": price,
             "special_price_enabled": False, "promotion_enabled": False,
@@ -623,16 +709,18 @@ async def push_order_to_snc(items: List[Dict], chat_id: str, delivery_date: str,
             "auto_assign": False, "picked": False, "packed": False,
             "packed_qty": 0, "picked_qty": 0, "has_catch_weight": False,
             "cw_conversion": 1, "cw_price": price, "cw_qty": qty,
-            "actual_sku": it["sku"], "actual_name": it["full_name"],
-            "actual_uom": it["uom"], "actual_uom_id": it["uom_id"],
-            "actual_base_uom_id": it["base_uom_id"], "actual_base_uom": it["base_uom"],
+            "actual_sku": sku, "actual_name": name,
+            "actual_uom": uom, "actual_uom_id": uom_id,
+            "actual_base_uom_id": uom_id, "actual_base_uom": uom,
             "actual_conversion_rate": 1, "actual_qty_for_return": qty,
             "actual_price": price, "drop_shipping": False,
             "drop_shipping_from_product": "No Drop Ship", "tags": [],
         })
-    if not item_info: return None
 
-    # Get slot_info from SNC (required field) — use default if not available
+    if not item_info:
+        logger.error("push_order: no items to send")
+        return None
+
     slot_info = {
         "slot_id": None, "delivery_type": "Delivery",
         "cut_off_name": "Morning - 9:00 am", "cut_off_period": "09:00",
@@ -642,13 +730,13 @@ async def push_order_to_snc(items: List[Dict], chat_id: str, delivery_date: str,
     order_payload = {
         "company_id": company_id, "source": "B2B", "platform": "Whatsapp",
         "store_id": store_id, "store": store,
-        "branch_id": branch_id if branch_id != "main" else "",
-        "branch_name": branch_name,
+        "branch_id": branch_id, "branch_name": branch_name,
         "slot_info": slot_info,
         "currency": "SGD", "items_count": len(item_info),
         "order_status": "Pending", "paid_status": "Pending",
         "delivery_type": "Delivery", "delivery_date": delivery,
-        "item_total": item_total, "tax_amount": tax_total,
+        "item_total": round(item_total, 5),
+        "tax_amount": round(tax_total, 5),
         "total_amount": round(item_total + tax_total, 5),
         "created_by": username, "updated_by": username,
         "created_by_id": user_id, "user_id": user_id, "user_name": username,
@@ -660,44 +748,24 @@ async def push_order_to_snc(items: List[Dict], chat_id: str, delivery_date: str,
         "installation_info": {"installation":False,"installation_date":None,"installation_charges":0},
         "whatsapp_contact_id": chat_id,
     }
-    logger.info("push_order payload: store_id=%s branch_id=%s items=%d total=%.2f",
+
+    logger.info("push_order: store_id=%s branch_id=%s items=%d total=%.2f",
                 store_id, branch_id, len(item_info), round(item_total+tax_total,2))
 
-    result = await snc_call("/b2b/order/save", {"data": order_payload})
-    if result:
-        order_num = result.get("result",{}).get("order_number") or result.get("order_number")
-        logger.info("Order created: %s", order_num)
-        return order_num
-    return None
+    try:
+        result = await snc_call("/b2b/order/save", {"data": order_payload})
+    except Exception as e:
+        logger.error("push_order snc_call exception: %s", e)
+        return None
 
-# ─── Agent message handler ────────────────────────────────────────────────────
-def build_reply(analysis: Dict, sender: str) -> str:
-    if analysis.get("reply"): return analysis["reply"]
-    intent = analysis.get("intent","UNKNOWN")
-    items  = analysis.get("items",[])
-    order_num = analysis.get("order_number")
+    if not result:
+        logger.error("push_order: snc_call returned None")
+        return None
 
-    if intent == "NEW_ORDER":
-        if items:
-            lines = "\n".join([f"  • *{i['name']}* × {i['qty']} {i['uom']}" for i in items])
-            return f"Got it {sender}! 🛒\n\n{lines}\n\n✅ Reply *CONFIRM* to place order\n📅 Delivery date?"
-        return f"Hi {sender}! 🛒 What would you like to order?\n\nExample: _5 boxes chicken karaage, delivery tomorrow_"
-    elif intent == "AMEND_ORDER":
-        msg = f"Sure {sender}! ✏️ "
-        if order_num: msg += f"Order *{order_num}* — "
-        if items: msg += "\n".join([f"{i['name']} → {i['qty']} {i['uom']}" for i in items])
-        return msg + "\n\n✅ Reply *CONFIRM* to apply changes"
-    elif intent == "CANCEL_ORDER":
-        if order_num: return f"Cancel *{order_num}*? ❌\n\nReply *CANCEL {order_num}* to confirm."
-        return f"Please share your *order number* to cancel."
-    elif intent == "ORDER_STATUS":
-        return f"Checking your order status, {sender}... 📦\n\nPlease share your order number if you have it."
-    elif intent == "ENQUIRY":
-        return f"Thanks for your enquiry {sender}! 💬\n\nContact your sales rep for pricing & availability."
-    elif intent == "GREETING":
-        return (f"Hi {sender}! 👋\n\nHow can I help?\n"
-                "🛒 New order\n✏️ Amend order\n❌ Cancel order\n📦 Order status\n💬 Enquiry")
-    return f"Thanks {sender}! How can I help you today? 🙏"
+    order_num = (result.get("result") or {}).get("order_number") or result.get("order_number")
+    logger.info("push_order result: order_num=%s keys=%s", order_num, list(result.keys()))
+    return order_num
+
 
 async def process_incoming_message(message: Dict, contact: Dict, company_id: str, chat_id: str):
     if not credentials["agent"]["enabled"]: return
@@ -882,6 +950,17 @@ async def resolve_user():
                 return {"error": str(e)}
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/refresh-token")
+async def refresh_token():
+    """Manually trigger token refresh."""
+    ok = await auto_refresh_token()
+    return {
+        "success": ok,
+        "has_token": bool(credentials["snc"].get("access_token")),
+        "user_id": credentials["snc"].get("user_id",""),
+    }
 
 
 @app.get("/health")
