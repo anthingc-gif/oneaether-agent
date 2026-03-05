@@ -889,6 +889,63 @@ async def serve_frontend():
     if html_file.exists(): return HTMLResponse(content=html_file.read_text())
     return HTMLResponse(content="<h2>✓ oneaether.ai running</h2>")
 
+@app.get("/debug/wa-contact/{phone}")
+async def debug_wa_contact(phone: str):
+    """Get real store_id/branch_id for a WhatsApp contact from SNC."""
+    # Strip non-digits
+    clean_phone = phone.replace("@s.whatsapp.net","").replace("@g.us","").replace("+","")
+    result = await snc_call("/whatsapp/contacts/get", {"data": {"filter_by": {
+        "phone_number": clean_phone,
+        "search_text": "",
+        "exact_match": False,
+        "pagination": {"page_no":1,"no_of_recs":5,"sort_by":"timestamp","order_by":False},
+        "include_columns": []
+    }}})
+    if not result:
+        return {"error": "snc_call failed", "phone": clean_phone}
+    r    = result.get("result",{})
+    meta = r.get("metadata",{})
+    # Try all keys
+    contacts = (meta.get("ContactsList") or meta.get("contacts") or
+                meta.get("data") or r.get("data") or [])
+    out = []
+    for c in (contacts if isinstance(contacts,list) else []):
+        out.append({
+            "store_id":    c.get("store_id"),
+            "branch_id":   c.get("branch_id"),
+            "store":       c.get("store") or c.get("customer_name"),
+            "branch_name": c.get("branch_name"),
+            "phone":       c.get("phone") or c.get("whatsapp_number"),
+            "all_keys":    list(c.keys()),
+        })
+    return {"phone_used": clean_phone, "contacts": out,
+            "raw_keys": list(meta.keys()), "raw": str(result)[:500]}
+
+
+@app.get("/debug/customer-branches/{customer_id}")
+async def debug_customer_branches(customer_id: str):
+    """Try all known SNC endpoints to find branches for a customer."""
+    results = {}
+
+    # Try 1: b2b/customer/branches
+    for ep in ["/b2b/customer/branches", "/customers/branches", "/branch/get", "/branches/get"]:
+        r = await snc_call(ep, {"data": {"customer_id": customer_id}})
+        results[ep] = str(r)[:200] if r else "None"
+
+    # Try 2: Get store list
+    r2 = await snc_call("/store/get", {"data": {"filter_by": {
+        "customer_id": customer_id,
+        "pagination": {"page_no":1,"no_of_recs":20,"sort_by":"cts","order_by":False}
+    }}})
+    results["/store/get"] = str(r2)[:300] if r2 else "None"
+
+    # Try 3: outlets
+    r3 = await snc_call("/outlets/get", {"data": {"customer_id": customer_id}})
+    results["/outlets/get"] = str(r3)[:200] if r3 else "None"
+
+    return results
+
+
 @app.get("/debug/customer-lookup/{name}")
 async def debug_customer_lookup(name: str):
     """Find real store_id and branch_id for a customer by name."""
