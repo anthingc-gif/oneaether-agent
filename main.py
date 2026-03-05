@@ -115,10 +115,12 @@ def db_set_credential(key: str, value: str):
     db.execute("INSERT OR REPLACE INTO credentials(key,value,uts) VALUES(?,?,datetime('now'))", (key, value))
     db.commit(); db.close()
 
-# Store encrypted SNC credentials for auto-refresh
-# These are the Fernet-encrypted values from the browser/Postman
+# SNC account constants (from Postman collection)
 SNC_ENC_USERNAME = "gAAAAABoqEPZGYCgChT1WhZBGw27VZsOAPIfR4GuBCjd0YsYl5115GocjXjPKYWEQjZVvbfdL5Ibsf5_7KomKdn5Xqm3A9vmYXIoudeREWERO8-D_1OkoSc="
 SNC_ENC_PASSWORD = "gAAAAABoqEPZbvRypzhBV1omAh9YOWFUjCZJRvJ8Ub2Nnjzv0jCMDFWrZNiFGPPdRQA6Vs1LbPTIvN-EE_HcXm8UXia5u2w93w=="
+SNC_HARDCODED_USER_ID  = "1qxcb0ssTRGPQaKogvtkMw"
+SNC_HARDCODED_USERNAME = "admin@mindmastersg.com"
+SNC_HARDCODED_COMPANY  = "mindmasters"
 
 async def auto_refresh_token() -> bool:
     """Login to SNC using stored encrypted credentials to get a fresh token."""
@@ -143,13 +145,8 @@ async def auto_refresh_token() -> bool:
                     logger.info("Login response keys: %s", list(data.keys()))
                     logger.info("Login response snippet: %s", str(data)[:300])
                     # Try all known locations for user_id
-                    uid = (data.get("user_id") or data.get("id") or
-                           data.get("_id") or
-                           (data.get("user") or {}).get("user_id") or
-                           (data.get("user") or {}).get("id") or
-                           (data.get("data") or {}).get("user_id") or
-                           credentials["snc"].get("user_id","") or
-                           "1qxcb0ssTRGPQaKogvtkMw")
+                    # JWT and login response don't contain user_id — use known constant
+                    uid = SNC_HARDCODED_USER_ID
                     credentials["snc"]["access_token"] = token
                     credentials["snc"]["user_id"]      = uid
                     credentials["snc"]["username"]     = data.get("username","") or credentials["snc"].get("username","")
@@ -356,8 +353,8 @@ def snc_headers():
 
 def snc_base():
     # user_id is required by SNC — decode from JWT token if not set
-    user_id  = credentials["snc"].get("user_id","") or os.getenv("SNC_USER_ID","") or "1qxcb0ssTRGPQaKogvtkMw"
-    username = credentials["snc"].get("username","") or os.getenv("SNC_USERNAME","") or "admin@mindmastersg.com"
+    user_id  = credentials["snc"].get("user_id","") or os.getenv("SNC_USER_ID","") or SNC_HARDCODED_USER_ID
+    username = credentials["snc"].get("username","") or os.getenv("SNC_USERNAME","") or SNC_HARDCODED_USERNAME
     if not credentials["snc"].get("user_id",""):
         try:
             import base64, json as _json
@@ -394,7 +391,10 @@ async def poll_job(job_id: str, timeout: int = 30) -> Optional[Dict]:
                 data = resp.json()
                 process_status = data.get("process_status","")
                 logger.info("poll_job %s attempt=%d status=%s", job_id, attempt, process_status)
-                if process_status == "processed" or data.get("result") is not None:
+                has_result = data.get("result") is not None
+                is_processed = process_status in ("processed", "completed", "done", "success")
+                has_order = bool((data.get("result") or {}).get("order_number"))
+                if is_processed or has_result or has_order:
                     return data
                 await asyncio.sleep(2)
             except Exception as e:
@@ -441,7 +441,9 @@ async def snc_call(endpoint: str, body: Dict) -> Optional[Dict]:
             job_id = data.get("job_id")
             if job_id:
                 result = await poll_job(job_id)
-                logger.info("snc_call %s poll result keys=%s", endpoint, list(result.keys()) if result else None)
+                logger.info("snc_call %s poll result keys=%s snippet=%s",
+                            endpoint, list(result.keys()) if result else None,
+                            str(result)[:300] if result else None)
                 return result
             # Some endpoints return result directly
             if data.get("result") is not None:
@@ -674,14 +676,31 @@ async def push_order_to_snc(items: List[Dict], chat_id: str, delivery_date: str,
     store       = assignment.get("customer","")
     branch_id   = assignment.get("branch_id","") or ""
     branch_name = assignment.get("branch","Main Branch")
-    username    = credentials["snc"].get("username","") or os.getenv("SNC_USERNAME","") or "admin@mindmastersg.com"
-    user_id     = credentials["snc"].get("user_id","") or os.getenv("SNC_USER_ID","") or "1qxcb0ssTRGPQaKogvtkMw"
-    company_id  = credentials["snc"].get("company_id","mindmasters")
+    username    = credentials["snc"].get("username","") or SNC_HARDCODED_USERNAME
+    user_id     = credentials["snc"].get("user_id","") or SNC_HARDCODED_USER_ID
+    company_id  = credentials["snc"].get("company_id","") or SNC_HARDCODED_COMPANY
     delivery    = delivery_date or (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
 
     # Clean branch_id — "main" is a placeholder, not a real SNC ID
-    if branch_id == "main":
+    if branch_id in ("main", "Main Branch", ""):
         branch_id = ""
+        # Try to get real branch from customers DB
+        if store_id:
+            db = get_db()
+            row = db.execute("SELECT raw FROM customers WHERE customer_id=? OR store_id=?",
+                             (store_id, store_id)).fetchone()
+            db.close()
+            if row:
+                try:
+                    raw = json.loads(row["raw"])
+                    b2b = raw.get("b2b_settings") or {}
+                    stores = b2b.get("stores") or []
+                    if stores:
+                        branch_id   = stores[0].get("branch_id","")
+                        branch_name = stores[0].get("branch_name", branch_name)
+                        logger.info("Resolved branch from DB: branch_id=%s", branch_id)
+                except Exception as e:
+                    logger.warning("Branch resolve error: %s", e)
 
     item_info  = []
     item_total = 0.0
@@ -939,9 +958,9 @@ async def debug_test_order():
             "order_number":   result,
             "success":        bool(result),
             "assignment":     assignment,
-            "snc_user_id":    credentials["snc"].get("user_id",""),
+            "snc_user_id":    credentials["snc"].get("user_id","") or SNC_HARDCODED_USER_ID,
             "snc_token_set":  bool(credentials["snc"].get("access_token")),
-            "snc_company_id": credentials["snc"].get("company_id",""),
+            "snc_company_id": credentials["snc"].get("company_id","") or SNC_HARDCODED_COMPANY,
         }
     except Exception as e:
         import traceback
