@@ -880,6 +880,32 @@ async def debug_products_test():
     }
 
 
+@app.get("/debug/test-order")
+async def debug_test_order():
+    """Test order creation with full error details."""
+    try:
+        chat_id   = "6587264539@s.whatsapp.net"
+        items     = [{"name": "Chicken Karaage", "qty": 1, "uom": "pkt",
+                      "full_name": body.get("item","Chicken Karaage"), "sku": "",
+                      "item_id": "", "uom_id": "", "base_uom": "pkt", "base_uom_id": "",
+                      "price": 10.0, "tax_rate": 9, "tax_code": "SR9", "tax_code_id": "", "found": True}]
+        assignment = db_get_assignment(chat_id) or {}
+        result = await push_order_to_snc(
+            items=items, chat_id=chat_id,
+            delivery_date=(datetime.now()+timedelta(days=1)).strftime("%Y-%m-%d"),
+            sender_name="Test"
+        )
+        return {
+            "order_number": result,
+            "assignment": assignment,
+            "snc_user_id": credentials["snc"].get("user_id",""),
+            "snc_token_set": bool(credentials["snc"].get("access_token")),
+        }
+    except Exception as e:
+        import traceback
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+
 @app.get("/debug/order-test/{chat_id:path}")
 async def debug_order_test(chat_id: str):
     """Test all prerequisites for order creation."""
@@ -952,6 +978,7 @@ async def resolve_user():
         raise HTTPException(status_code=502, detail=str(e))
 
 
+@app.get("/refresh-token")
 @app.post("/refresh-token")
 async def refresh_token():
     """Manually trigger token refresh."""
