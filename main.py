@@ -939,29 +939,96 @@ async def debug_products_test():
 
 @app.get("/debug/test-order")
 async def debug_test_order():
-    """Test order creation with full error details — opens in browser."""
-    try:
-        chat_id = "6587264539@s.whatsapp.net"
-        items = [{
-            "name": "Chicken Karaage", "qty": 1, "uom": "pkt",
-            "full_name": "Chicken Karaage", "sku": "TEST-SKU",
-            "item_id": "", "uom_id": "", "base_uom": "pkt", "base_uom_id": "",
-            "price": 10.0, "tax_rate": 9, "tax_code": "SR9", "tax_code_id": "", "found": True,
-        }]
-        assignment = db_get_assignment(chat_id) or {}
-        result = await push_order_to_snc(
-            items=items, chat_id=chat_id,
-            delivery_date=(datetime.now()+timedelta(days=1)).strftime("%Y-%m-%d"),
-            sender_name="Test"
-        )
-        return {
-            "order_number":   result,
-            "success":        bool(result),
-            "assignment":     assignment,
-            "snc_user_id":    credentials["snc"].get("user_id","") or SNC_HARDCODED_USER_ID,
-            "snc_token_set":  bool(credentials["snc"].get("access_token")),
-            "snc_company_id": credentials["snc"].get("company_id","") or SNC_HARDCODED_COMPANY,
+    """Raw direct test of /b2b/order/save — bypasses all wrappers."""
+    api_url    = credentials["snc"].get("api_url","https://enterprise.sellnchill.com/api")
+    token      = credentials["snc"].get("access_token","")
+    user_id    = SNC_HARDCODED_USER_ID
+    username   = SNC_HARDCODED_USERNAME
+    company_id = SNC_HARDCODED_COMPANY
+    delivery   = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # Get iSTEAKS assignment
+    assignment = db_get_assignment("6587264539@s.whatsapp.net") or {}
+    store_id   = assignment.get("store_id","121212")
+    branch_id  = assignment.get("branch_id","")
+    if branch_id in ("main",""):
+        branch_id = ""
+
+    # Step 1: get fresh token
+    if not token:
+        await auto_refresh_token()
+        token = credentials["snc"].get("access_token","")
+
+    payload = {
+        "company_id": company_id, "user_id": user_id, "username": username,
+        "timezone": "Asia/Singapore", "request_from": "WEB",
+        "data": {
+            "company_id": company_id, "source": "B2B", "platform": "Whatsapp",
+            "store_id": store_id, "store": "iSTEAKS",
+            "branch_id": branch_id, "branch_name": "Main Branch",
+            "slot_info": {"slot_id":None,"delivery_type":"Delivery","cut_off_name":"Morning - 9:00 am","cut_off_period":"09:00","start_period":None,"end_period":None,"default":True},
+            "currency": "SGD", "items_count": 1,
+            "order_status": "Pending", "paid_status": "Pending",
+            "delivery_type": "Delivery", "delivery_date": delivery,
+            "item_total": 10.0, "tax_amount": 0.9, "total_amount": 10.9,
+            "created_by": username, "updated_by": username,
+            "created_by_id": user_id, "user_id": user_id, "user_name": username,
+            "item_info": [{
+                "item_id": "", "name": "Test Item", "sku": "TEST",
+                "tax_code": "SR9", "tax_code_id": "", "tax_rate": 9, "tax_amount": 0.9,
+                "uom": "unit", "uom_id": "", "base_uom_id": "", "base_uom": "unit",
+                "conversion_rate": 1, "qty": 1, "new_qty": 1, "actual_qty": 1,
+                "total_order_qty": 0, "price": 10.0,
+                "special_price_enabled": False, "promotion_enabled": False,
+                "promotion_info": {"promotion_id":None,"name":None,"discount_type":None,"discount_value":None,"promotional_stock":None,"purchase_limit":None,"discount_amount":None},
+                "discount_info": {"discount_type":"% Discount","discount_id":None,"discount_name":None,"deal_id":None,"deal_name":None,"discount":0,"discount_amount":0,"coupon_code":0},
+                "item_total": 10.0, "adjusted_qty": 0, "available_qty": 0, "free": 0,
+                "is_offer_item": False, "actual_is_offer_item": False,
+                "movement_info": [], "new_movement_info": [],
+                "exchange": False, "damaged": False, "deleted": False,
+                "auto_assign": False, "picked": False, "packed": False,
+                "packed_qty": 0, "picked_qty": 0, "has_catch_weight": False,
+                "cw_conversion": 1, "cw_price": 10.0, "cw_qty": 1,
+                "actual_sku": "TEST", "actual_name": "Test Item",
+                "actual_uom": "unit", "actual_uom_id": "",
+                "actual_base_uom_id": "", "actual_base_uom": "unit",
+                "actual_conversion_rate": 1, "actual_qty_for_return": 1,
+                "actual_price": 10.0, "drop_shipping": False,
+                "drop_shipping_from_product": "No Drop Ship", "tags": [],
+            }],
+            "discount_info": {"discount_type":"% Discount","discount":0,"discount_amount":0,"discount_id":None,"discount_name":None,"deal_id":None,"deal_name":None,"coupon_code":None},
+            "coupon_info": {"discount_type":"% Discount","discount":0,"discount_amount":0,"discount_id":None,"discount_name":None,"deal_id":None,"deal_name":None,"coupon_code":None},
+            "free_shipping": False, "payment_info": [], "applied_credit_notes": [],
+            "advance_amount": 0, "delivery_charges": 0, "tax_inclusive": False,
+            "installation_info": {"installation":False,"installation_date":None,"installation_charges":0},
+            "whatsapp_contact_id": "6587264539@s.whatsapp.net",
         }
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{api_url}/b2b/order/save",
+                json=payload,
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            )
+            resp_data = resp.json()
+            job_id = resp_data.get("job_id")
+
+            # Poll job
+            poll_result = None
+            if job_id:
+                poll_result = await poll_job(job_id)
+
+            return {
+                "step1_http":     resp.status_code,
+                "step1_response": resp_data,
+                "step2_job_id":   job_id,
+                "step3_poll":     poll_result,
+                "store_id_used":  store_id,
+                "branch_id_used": branch_id,
+                "user_id_used":   user_id,
+            }
     except Exception as e:
         import traceback
         return {"error": str(e), "traceback": traceback.format_exc()}
