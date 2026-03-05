@@ -139,11 +139,24 @@ async def auto_refresh_token() -> bool:
                 data = resp.json()
                 token = data.get("access_token", "")
                 if token:
+                    # SNC login response keys vary — log to find user_id location
+                    logger.info("Login response keys: %s", list(data.keys()))
+                    logger.info("Login response snippet: %s", str(data)[:300])
+                    # Try all known locations for user_id
+                    uid = (data.get("user_id") or data.get("id") or
+                           data.get("_id") or
+                           (data.get("user") or {}).get("user_id") or
+                           (data.get("user") or {}).get("id") or
+                           (data.get("data") or {}).get("user_id") or
+                           credentials["snc"].get("user_id","") or
+                           "1qxcb0ssTRGPQaKogvtkMw")
                     credentials["snc"]["access_token"] = token
-                    credentials["snc"]["user_id"]      = data.get("user_id", credentials["snc"].get("user_id",""))
-                    db_set_credential("snc_token",   token)
-                    db_set_credential("snc_user_id", credentials["snc"]["user_id"])
-                    logger.info("Token refreshed! user_id=%s", credentials["snc"]["user_id"])
+                    credentials["snc"]["user_id"]      = uid
+                    credentials["snc"]["username"]     = data.get("username","") or credentials["snc"].get("username","")
+                    db_set_credential("snc_token",    token)
+                    db_set_credential("snc_user_id",  uid)
+                    db_set_credential("snc_username", credentials["snc"]["username"])
+                    logger.info("Token refreshed! user_id=%s username=%s", uid, credentials["snc"]["username"])
                     return True
             logger.error("Auto-login failed: %s %s", resp.status_code, resp.text[:200])
             return False
@@ -343,8 +356,8 @@ def snc_headers():
 
 def snc_base():
     # user_id is required by SNC — decode from JWT token if not set
-    user_id  = credentials["snc"].get("user_id","") or "1qxcb0ssTRGPQaKogvtkMw"
-    username = credentials["snc"].get("username","") or "admin@mindmastersg.com"
+    user_id  = credentials["snc"].get("user_id","") or os.getenv("SNC_USER_ID","") or "1qxcb0ssTRGPQaKogvtkMw"
+    username = credentials["snc"].get("username","") or os.getenv("SNC_USERNAME","") or "admin@mindmastersg.com"
     if not credentials["snc"].get("user_id",""):
         try:
             import base64, json as _json
@@ -661,8 +674,8 @@ async def push_order_to_snc(items: List[Dict], chat_id: str, delivery_date: str,
     store       = assignment.get("customer","")
     branch_id   = assignment.get("branch_id","") or ""
     branch_name = assignment.get("branch","Main Branch")
-    username    = credentials["snc"].get("username","") or "admin@mindmastersg.com"
-    user_id     = credentials["snc"].get("user_id","") or "1qxcb0ssTRGPQaKogvtkMw"
+    username    = credentials["snc"].get("username","") or os.getenv("SNC_USERNAME","") or "admin@mindmastersg.com"
+    user_id     = credentials["snc"].get("user_id","") or os.getenv("SNC_USER_ID","") or "1qxcb0ssTRGPQaKogvtkMw"
     company_id  = credentials["snc"].get("company_id","mindmasters")
     delivery    = delivery_date or (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
 
@@ -856,6 +869,31 @@ async def serve_frontend():
     html_file = Path(__file__).parent / "oneaether.html"
     if html_file.exists(): return HTMLResponse(content=html_file.read_text())
     return HTMLResponse(content="<h2>✓ oneaether.ai running</h2>")
+
+@app.get("/debug/login-response")
+async def debug_login_response():
+    """Show raw SNC login response to find user_id field."""
+    api_url  = credentials["snc"].get("api_url","https://enterprise.sellnchill.com/api")
+    enc_user = os.getenv("SNC_ENC_USERNAME", SNC_ENC_USERNAME)
+    enc_pass = os.getenv("SNC_ENC_PASSWORD", SNC_ENC_PASSWORD)
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post(f"{api_url}/login", data={
+                "username": enc_user, "password": enc_pass,
+                "grant_type": "password", "notification": "false",
+            })
+            data = resp.json()
+            return {
+                "http_status": resp.status_code,
+                "keys":        list(data.keys()),
+                "user_id":     data.get("user_id"),
+                "id":          data.get("id"),
+                "username_field": data.get("username"),
+                "full_response": str(data)[:1000],
+            }
+    except Exception as e:
+        return {"error": str(e)}
+
 
 @app.get("/debug/products-test")
 async def debug_products_test():
