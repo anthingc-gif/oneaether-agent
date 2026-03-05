@@ -378,28 +378,28 @@ def snc_base():
 def whapi_headers():
     return {"Authorization": f"Bearer {credentials['whapi'].get('token','')}", "Content-Type": "application/json"}
 
-async def poll_job(job_id: str, timeout: int = 30) -> Optional[Dict]:
+async def poll_job(job_id: str, timeout: int = 25) -> Optional[Dict]:
     api_url = credentials["snc"].get("api_url","")
     if not api_url: return None
     deadline = time.time() + timeout
-    async with httpx.AsyncClient(timeout=10) as client:
-        attempt = 0
-        while time.time() < deadline:
-            attempt += 1
-            try:
+    attempt  = 0
+    while time.time() < deadline:
+        attempt += 1
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
                 resp = await client.get(f"{api_url}/job/{job_id}", headers=snc_headers())
                 data = resp.json()
-                process_status = data.get("process_status","")
-                logger.info("poll_job %s attempt=%d status=%s", job_id, attempt, process_status)
-                has_result = data.get("result") is not None
-                is_processed = process_status in ("processed", "completed", "done", "success")
-                has_order = bool((data.get("result") or {}).get("order_number"))
-                if is_processed or has_result or has_order:
-                    return data
-                await asyncio.sleep(2)
-            except Exception as e:
-                logger.warning("poll_job %s error: %s", job_id, e)
-                await asyncio.sleep(2)
+            process_status = data.get("process_status","")
+            logger.info("poll_job %s attempt=%d status=%s", job_id, attempt, process_status)
+            is_processed = process_status in ("processed","completed","done","success")
+            has_result   = data.get("result") is not None
+            has_order    = bool((data.get("result") or {}).get("order_number"))
+            if is_processed or has_result or has_order:
+                return data
+            await asyncio.sleep(2)
+        except Exception as e:
+            logger.warning("poll_job %s error: %s", job_id, e)
+            await asyncio.sleep(2)
     logger.error("poll_job %s timed out after %ds", job_id, timeout)
     return None
 
@@ -889,6 +889,29 @@ async def serve_frontend():
     if html_file.exists(): return HTMLResponse(content=html_file.read_text())
     return HTMLResponse(content="<h2>✓ oneaether.ai running</h2>")
 
+@app.get("/debug/customer-raw/{customer_id}")
+async def debug_customer_raw(customer_id: str):
+    """Show raw customer record from our DB."""
+    db = get_db()
+    row = db.execute("SELECT * FROM customers WHERE customer_id=?", (customer_id,)).fetchone()
+    db.close()
+    if not row:
+        return {"error": "Not found in DB"}
+    raw = json.loads(dict(row).get("raw","{}"))
+    b2b = raw.get("b2b_settings",{})
+    stores = b2b.get("stores",[])
+    return {
+        "customer_id":  row["customer_id"],
+        "customer_name":row["customer_name"],
+        "store_id":     row["store_id"],
+        "branch_id":    row["branch_id"],
+        "branch_name":  row["branch_name"],
+        "stores_count": len(stores),
+        "stores":       stores,
+        "b2b_keys":     list(b2b.keys()),
+    }
+
+
 @app.get("/debug/wa-contact/{phone}")
 async def debug_wa_contact(phone: str):
     """Get real store_id/branch_id for a WhatsApp contact from SNC."""
@@ -905,21 +928,14 @@ async def debug_wa_contact(phone: str):
         return {"error": "snc_call failed", "phone": clean_phone}
     r    = result.get("result",{})
     meta = r.get("metadata",{})
-    # Try all keys
-    contacts = (meta.get("ContactsList") or meta.get("contacts") or
-                meta.get("data") or r.get("data") or [])
-    out = []
-    for c in (contacts if isinstance(contacts,list) else []):
-        out.append({
-            "store_id":    c.get("store_id"),
-            "branch_id":   c.get("branch_id"),
-            "store":       c.get("store") or c.get("customer_name"),
-            "branch_name": c.get("branch_name"),
-            "phone":       c.get("phone") or c.get("whatsapp_number"),
-            "all_keys":    list(c.keys()),
-        })
-    return {"phone_used": clean_phone, "contacts": out,
-            "raw_keys": list(meta.keys()), "raw": str(result)[:500]}
+    # Full dump to see structure
+    return {
+        "phone_used":  clean_phone,
+        "result_keys": list(r.keys()),
+        "meta_keys":   list(meta.keys()),
+        "meta_sample": str(meta)[:800],
+        "full_result": str(result)[:1200],
+    }
 
 
 @app.get("/debug/customer-branches/{customer_id}")
