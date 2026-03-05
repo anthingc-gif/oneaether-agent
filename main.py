@@ -882,13 +882,15 @@ async def debug_products_test():
 
 @app.get("/debug/test-order")
 async def debug_test_order():
-    """Test order creation with full error details."""
+    """Test order creation with full error details — opens in browser."""
     try:
-        chat_id   = "6587264539@s.whatsapp.net"
-        items     = [{"name": "Chicken Karaage", "qty": 1, "uom": "pkt",
-                      "full_name": body.get("item","Chicken Karaage"), "sku": "",
-                      "item_id": "", "uom_id": "", "base_uom": "pkt", "base_uom_id": "",
-                      "price": 10.0, "tax_rate": 9, "tax_code": "SR9", "tax_code_id": "", "found": True}]
+        chat_id = "6587264539@s.whatsapp.net"
+        items = [{
+            "name": "Chicken Karaage", "qty": 1, "uom": "pkt",
+            "full_name": "Chicken Karaage", "sku": "TEST-SKU",
+            "item_id": "", "uom_id": "", "base_uom": "pkt", "base_uom_id": "",
+            "price": 10.0, "tax_rate": 9, "tax_code": "SR9", "tax_code_id": "", "found": True,
+        }]
         assignment = db_get_assignment(chat_id) or {}
         result = await push_order_to_snc(
             items=items, chat_id=chat_id,
@@ -896,10 +898,12 @@ async def debug_test_order():
             sender_name="Test"
         )
         return {
-            "order_number": result,
-            "assignment": assignment,
-            "snc_user_id": credentials["snc"].get("user_id",""),
-            "snc_token_set": bool(credentials["snc"].get("access_token")),
+            "order_number":   result,
+            "success":        bool(result),
+            "assignment":     assignment,
+            "snc_user_id":    credentials["snc"].get("user_id",""),
+            "snc_token_set":  bool(credentials["snc"].get("access_token")),
+            "snc_company_id": credentials["snc"].get("company_id",""),
         }
     except Exception as e:
         import traceback
