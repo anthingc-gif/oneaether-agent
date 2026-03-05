@@ -203,9 +203,12 @@ def db_log_message(chat_id: str, role: str, message: str, intent: str = ""):
 def db_upsert_customers(customers: List[Dict]):
     db = get_db()
     for c in customers:
-        # Handle both SNC formats: CustomersList items and /customers/get items
-        cid    = c.get("customer_id") or c.get("store_id") or c.get("id","")
-        name   = c.get("customer_name") or c.get("name") or c.get("store","")
+        # SNC has two IDs: customer_id (code like "121212") and internal _id/id
+        # Orders need the internal ID (like "tq9vW9BSTfq9qfOZMDlTgg")
+        internal_id = c.get("_id") or c.get("id","")
+        code_id     = c.get("customer_id","")
+        cid  = internal_id or code_id  # prefer internal
+        name = c.get("customer_name") or c.get("name") or c.get("store","")
         phone  = c.get("customer_phone") or c.get("phone","")
         email  = c.get("customer_email") or c.get("email","")
         # B2B settings contain store/branch info
@@ -477,11 +480,15 @@ async def whapi_send(to: str, body: str) -> bool:
 # ─── Sync functions ───────────────────────────────────────────────────────────
 async def sync_customers_from_snc(page: int = 1, per_page: int = 100) -> int:
     """Pull all customers from SNC and store in DB."""
-    result = await snc_call("/customers/get", {"data": {"filter_by": {
-        "search_on": ["customer_name","customer_phone","customer_email"],
-        "search_text": "", "exact_match": False,
-        "pagination": {"page_no": page, "no_of_recs": per_page, "sort_by": "cts", "order_by": False},
-    }}})
+    result = await snc_call("/customers/get", {
+        "custom": True,
+        "data": {"filter_by": {
+            "company_id": SNC_HARDCODED_COMPANY,
+            "search_on": ["customer_name","customer_phone","customer_email"],
+            "search_text": "", "exact_match": False,
+            "pagination": {"page_no": page, "no_of_recs": per_page, "sort_by": "cts", "order_by": False},
+        }}
+    })
     if not result:
         logger.error("sync_customers: snc_call returned None")
         return 0
@@ -504,11 +511,19 @@ async def sync_customers_from_snc(page: int = 1, per_page: int = 100) -> int:
 async def sync_products_from_snc(page: int = 1, per_page: int = 100) -> int:
     """Pull all products from SNC and store in DB."""
     result = await snc_call("/products/list", {"data": {"filter_by": {
-        "search_text": [], "search_on": ["name","sku"],
-        "confidence": 0.0, "exact_match": False,
+        "date_range": [],
+        "search_on": ["name","sku","product_code"],
+        "confidence": 0.5,
+        "search_text": [],
+        "exact_match": False,
         "pagination": {"page_no": page, "no_of_recs": per_page, "sort_by": "cts", "order_by": False},
-        "view": "individual", "status": "Active",
-        "include_columns": ["name","sku","prices","uom","uom_id","item_id","tax_code","tax_code_id","tax_rate"],
+        "view": "individual", "status": "All",
+        "include_columns": ["short_description","description","sku","short_name","name",
+            "parent_sku","product_code","category","sub_category","brand",
+            "uom","base_uom","prices","images","status","is_sellable","is_edited",
+            "b2b_enabled","pos_enabled","is_primary","merged_id","merged_skus",
+            "bom_type","linked_stores","inventory_type","quantity",
+            "uom_id","config","attribute_set"],
         "merged": True, "bundles": False,
     }}})
     if not result:
@@ -794,8 +809,13 @@ async def push_order_to_snc(items: List[Dict], chat_id: str, delivery_date: str,
         logger.error("push_order: snc_call returned None")
         return None
 
-    order_num = (result.get("result") or {}).get("order_number") or result.get("order_number")
-    logger.info("push_order result: order_num=%s keys=%s", order_num, list(result.keys()))
+    r = result.get("result") or {}
+    meta = r.get("metadata") or r
+    order_num = (meta.get("order_number") or r.get("order_number") or
+                 result.get("order_number") or
+                 (r.get("data") or {}).get("order_number"))
+    logger.info("push_order result: order_num=%s result_keys=%s meta_keys=%s",
+                order_num, list(r.keys()), list(meta.keys()) if isinstance(meta,dict) else "n/a")
     return order_num
 
 
@@ -1084,25 +1104,35 @@ async def debug_products_test():
 
 @app.get("/debug/test-order")
 async def debug_test_order():
-    """Raw direct test of /b2b/order/save — bypasses all wrappers."""
-    api_url    = credentials["snc"].get("api_url","https://enterprise.sellnchill.com/api")
-    token      = credentials["snc"].get("access_token","")
+    """Test order with real iSTEAKS IDs fetched from SNC."""
+    # Step 1: Get real internal IDs for iSTEAKS
+    result = await snc_call("/customers/get", {
+        "custom": True,
+        "data": {"filter_by": {"customer_id": "121212", "company_id": SNC_HARDCODED_COMPANY}}
+    })
+    store_id  = "121212"
+    branch_id = ""
+    branch_name = "Main Branch"
+    if result:
+        r    = result.get("result",{})
+        meta = r.get("metadata",{})
+        cl   = meta.get("CustomersList",[])
+        if cl:
+            c       = cl[0]
+            store_id    = c.get("_id") or c.get("id") or c.get("customer_id","121212")
+            b2b         = c.get("b2b_settings",{})
+            stores      = b2b.get("stores",[])
+            if stores:
+                branch_id   = stores[0].get("branch_id","")
+                branch_name = stores[0].get("branch_name","Main Branch")
+            logger.info("iSTEAKS real IDs: store_id=%s branch_id=%s raw_keys=%s", store_id, branch_id, list(c.keys()))
+
     user_id    = SNC_HARDCODED_USER_ID
     username   = SNC_HARDCODED_USERNAME
     company_id = SNC_HARDCODED_COMPANY
     delivery   = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-
-    # Get iSTEAKS assignment
-    assignment = db_get_assignment("6587264539@s.whatsapp.net") or {}
-    store_id   = assignment.get("store_id","121212")
-    branch_id  = assignment.get("branch_id","")
-    if branch_id in ("main",""):
-        branch_id = ""
-
-    # Step 1: get fresh token
-    if not token:
-        await auto_refresh_token()
-        token = credentials["snc"].get("access_token","")
+    api_url    = credentials["snc"].get("api_url","https://enterprise.sellnchill.com/api")
+    token      = credentials["snc"].get("access_token","")
 
     payload = {
         "company_id": company_id, "user_id": user_id, "username": username,
@@ -1110,69 +1140,65 @@ async def debug_test_order():
         "data": {
             "company_id": company_id, "source": "B2B", "platform": "Whatsapp",
             "store_id": store_id, "store": "iSTEAKS",
-            "branch_id": branch_id, "branch_name": "Main Branch",
+            "branch_id": branch_id, "branch_name": branch_name,
             "slot_info": {"slot_id":None,"delivery_type":"Delivery","cut_off_name":"Morning - 9:00 am","cut_off_period":"09:00","start_period":None,"end_period":None,"default":True},
             "currency": "SGD", "items_count": 1,
             "order_status": "Pending", "paid_status": "Pending",
             "delivery_type": "Delivery", "delivery_date": delivery,
-            "item_total": 10.0, "tax_amount": 0.9, "total_amount": 10.9,
+            "item_total": 13.0, "tax_amount": 1.17, "total_amount": 14.17,
             "created_by": username, "updated_by": username,
             "created_by_id": user_id, "user_id": user_id, "user_name": username,
+            "tax_code": {"tax_code":"SR9","tax_rate":9,"tax_code_id":"r4L4SqU4QSmMqU3EsOYJtg"},
+            "tax_inclusive": False,
             "item_info": [{
-                "item_id": "", "name": "Test Item", "sku": "TEST",
-                "tax_code": "SR9", "tax_code_id": "", "tax_rate": 9, "tax_amount": 0.9,
-                "uom": "unit", "uom_id": "", "base_uom_id": "", "base_uom": "unit",
+                "item_id": "LaEjED0hQ0GEvlDSfMk2pA",
+                "name": "THAILAND FROZEN CHICKEN KARAAGE 1KG",
+                "sku": "ig-chicken-karaage",
+                "tax_code": "SR9", "tax_code_id": "r4L4SqU4QSmMqU3EsOYJtg",
+                "tax_rate": 9, "tax_amount": 1.17,
+                "uom": "PKT", "uom_id": "Zye6i55vQCSVQbGdZL6aOQ",
+                "base_uom_id": "Zye6i55vQCSVQbGdZL6aOQ", "base_uom": "PKT",
                 "conversion_rate": 1, "qty": 1, "new_qty": 1, "actual_qty": 1,
-                "total_order_qty": 0, "price": 10.0,
+                "total_order_qty": 0, "price": 13.0,
                 "special_price_enabled": False, "promotion_enabled": False,
                 "promotion_info": {"promotion_id":None,"name":None,"discount_type":None,"discount_value":None,"promotional_stock":None,"purchase_limit":None,"discount_amount":None},
                 "discount_info": {"discount_type":"% Discount","discount_id":None,"discount_name":None,"deal_id":None,"deal_name":None,"discount":0,"discount_amount":0,"coupon_code":0},
-                "item_total": 10.0, "adjusted_qty": 0, "available_qty": 0, "free": 0,
+                "item_total": 13.0, "adjusted_qty": 0, "available_qty": 0, "free": 0,
                 "is_offer_item": False, "actual_is_offer_item": False,
                 "movement_info": [], "new_movement_info": [],
                 "exchange": False, "damaged": False, "deleted": False,
                 "auto_assign": False, "picked": False, "packed": False,
                 "packed_qty": 0, "picked_qty": 0, "has_catch_weight": False,
-                "cw_conversion": 1, "cw_price": 10.0, "cw_qty": 1,
-                "actual_sku": "TEST", "actual_name": "Test Item",
-                "actual_uom": "unit", "actual_uom_id": "",
-                "actual_base_uom_id": "", "actual_base_uom": "unit",
+                "cw_conversion": 1, "cw_price": 13.0, "cw_qty": 1,
+                "actual_sku": "ig-chicken-karaage",
+                "actual_name": "THAILAND FROZEN CHICKEN KARAAGE 1KG",
+                "actual_uom": "PKT", "actual_uom_id": "Zye6i55vQCSVQbGdZL6aOQ",
+                "actual_base_uom_id": "Zye6i55vQCSVQbGdZL6aOQ", "actual_base_uom": "PKT",
                 "actual_conversion_rate": 1, "actual_qty_for_return": 1,
-                "actual_price": 10.0, "drop_shipping": False,
+                "actual_price": 13.0, "drop_shipping": False,
                 "drop_shipping_from_product": "No Drop Ship", "tags": [],
             }],
             "discount_info": {"discount_type":"% Discount","discount":0,"discount_amount":0,"discount_id":None,"discount_name":None,"deal_id":None,"deal_name":None,"coupon_code":None},
-            "coupon_info": {"discount_type":"% Discount","discount":0,"discount_amount":0,"discount_id":None,"discount_name":None,"deal_id":None,"deal_name":None,"coupon_code":None},
+            "coupon_info":   {"discount_type":"% Discount","discount":0,"discount_amount":0,"discount_id":None,"discount_name":None,"deal_id":None,"deal_name":None,"coupon_code":None},
             "free_shipping": False, "payment_info": [], "applied_credit_notes": [],
-            "advance_amount": 0, "delivery_charges": 0, "tax_inclusive": False,
+            "advance_amount": 0, "delivery_charges": 0,
             "installation_info": {"installation":False,"installation_date":None,"installation_charges":0},
             "whatsapp_contact_id": "6587264539@s.whatsapp.net",
         }
     }
-
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                f"{api_url}/b2b/order/save",
-                json=payload,
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-            )
+            resp = await client.post(f"{api_url}/b2b/order/save", json=payload,
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
             resp_data = resp.json()
             job_id = resp_data.get("job_id")
-
-            # Poll job
-            poll_result = None
-            if job_id:
-                poll_result = await poll_job(job_id)
-
+            poll_result = await poll_job(job_id) if job_id else None
             return {
-                "step1_http":     resp.status_code,
-                "step1_response": resp_data,
-                "step2_job_id":   job_id,
-                "step3_poll":     poll_result,
                 "store_id_used":  store_id,
                 "branch_id_used": branch_id,
-                "user_id_used":   user_id,
+                "step1_http":     resp.status_code,
+                "step1_response": resp_data,
+                "step3_poll":     poll_result,
             }
     except Exception as e:
         import traceback
@@ -1549,6 +1575,30 @@ async def process_message(request: Request, background_tasks: BackgroundTasks):
     messages   = body.get("messages",[])
     contact    = body.get("contacts",{})
     company_id = body.get("company_id", credentials["snc"].get("company_id",""))
+
+    # Auto-assign customer from contacts payload (matches Postman webhook format)
+    # contacts.customers[0] contains customer_id and customer_branch_id
+    if contact and isinstance(contact, dict):
+        wa_customers = contact.get("customers", [])
+        if wa_customers:
+            for message in messages:
+                chat_id = message.get("chat_id","")
+                if chat_id and not db_get_assignment(chat_id):
+                    wc = wa_customers[0]
+                    auto_cid    = wc.get("customer_id","")
+                    auto_branch = wc.get("customer_branch_id","")
+                    auto_bname  = wc.get("customer_branch_name","Main Branch")
+                    auto_cname  = wc.get("customer_name","")
+                    if auto_cid:
+                        db_save_assignment(chat_id, {
+                            "customer_id": auto_cid,
+                            "customer":    auto_cname,
+                            "store_id":    auto_cid,
+                            "branch_id":   auto_branch,
+                            "branch":      auto_bname,
+                        })
+                        logger.info("Auto-assigned %s → %s / %s", chat_id, auto_cname, auto_branch)
+
     for message in messages:
         if message.get("from_me"): continue
         if message.get("type") not in ("text","image","document","audio","voice"): continue
