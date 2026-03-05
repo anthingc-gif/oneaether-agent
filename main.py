@@ -889,6 +889,33 @@ async def serve_frontend():
     if html_file.exists(): return HTMLResponse(content=html_file.read_text())
     return HTMLResponse(content="<h2>✓ oneaether.ai running</h2>")
 
+@app.get("/debug/customer-lookup/{name}")
+async def debug_customer_lookup(name: str):
+    """Find real store_id and branch_id for a customer by name."""
+    result = await snc_call("/customers/get", {"data": {"filter_by": {
+        "search_on": ["customer_name"],
+        "search_text": name,
+        "exact_match": False,
+        "pagination": {"page_no": 1, "no_of_recs": 5, "sort_by": "cts", "order_by": False},
+    }}})
+    if not result:
+        return {"error": "snc_call failed"}
+    r      = result.get("result", {})
+    meta   = r.get("metadata", {})
+    customers = meta.get("CustomersList", [])
+    out = []
+    for c in customers:
+        b2b    = c.get("b2b_settings") or {}
+        stores = b2b.get("stores") or []
+        out.append({
+            "customer_id":   c.get("customer_id"),
+            "customer_name": c.get("customer_name"),
+            "stores":        stores,
+            "raw_b2b_keys":  list(b2b.keys()),
+        })
+    return {"customers": out, "raw_snippet": str(customers[0])[:500] if customers else None}
+
+
 @app.get("/debug/login-response")
 async def debug_login_response():
     """Show raw SNC login response to find user_id field."""
