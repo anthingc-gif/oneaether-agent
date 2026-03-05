@@ -203,30 +203,76 @@ def db_log_message(chat_id: str, role: str, message: str, intent: str = ""):
 def db_upsert_customers(customers: List[Dict]):
     db = get_db()
     for c in customers:
-        # SNC has two IDs: customer_id (code like "121212") and internal _id/id
-        # Orders need the internal ID (like "tq9vW9BSTfq9qfOZMDlTgg")
-        internal_id = c.get("_id") or c.get("id","")
-        code_id     = c.get("customer_id","")
-        cid  = internal_id or code_id  # prefer internal
-        name = c.get("customer_name") or c.get("name") or c.get("store","")
-        phone  = c.get("customer_phone") or c.get("phone","")
-        email  = c.get("customer_email") or c.get("email","")
-        # B2B settings contain store/branch info
-        b2b    = c.get("b2b_settings") or {}
-        stores = b2b.get("stores") or c.get("stores") or []
-        store_id   = (stores[0].get("store_id","") if stores else "") or c.get("store_id","")
-        branch_id  = (stores[0].get("branch_id","") if stores else "") or c.get("branch_id","")
-        branch_name= (stores[0].get("branch_name","") if stores else "") or c.get("branch_name","Main Branch")
-        credit_term= c.get("credit_term","") or (b2b.get("credit_term") or {}).get("credit_term","")
-        status = c.get("status","Active")
+        # customer_id field is display code (e.g. "121212")
+        # Use it as primary key since it's the stable identifier
+        cid   = c.get("customer_id","")
         if not cid: continue
-        db.execute("""INSERT OR REPLACE INTO customers
-            (customer_id,store_id,customer_name,phone,email,store,branch_id,branch_name,address,credit_term,status,raw,synced_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))""",
-            (cid, store_id, name, phone, email, name,
-             branch_id, branch_name,
-             json.dumps(c.get("address",{})), credit_term,
-             status, json.dumps(c)))
+        name  = c.get("customer_name","")
+        b2b   = c.get("b2b_settings") or {}
+        stores = b2b.get("stores") or []
+
+        # Extract first store/branch
+        store_id    = (stores[0].get("store_id","")    if stores else "") or c.get("store_id","")
+        branch_id   = (stores[0].get("branch_id","")   if stores else "") or c.get("branch_id","")
+        branch_name = (stores[0].get("branch_name","") if stores else "") or c.get("branch_name","")
+
+        # Credit term
+        ct_obj      = b2b.get("credit_term") or {}
+        credit_term = ct_obj.get("credit_term","") or c.get("credit_term","")
+        credit_term_id = ct_obj.get("credit_term_id","")
+
+        # Price tier
+        pt_obj      = b2b.get("price_tier") or {}
+        price_tier  = pt_obj.get("name","")
+
+        # Financial
+        outstanding = b2b.get("outstanding_amount", 0) or 0
+        max_credit  = b2b.get("max_credit_limit", 0) or 0
+        min_order   = b2b.get("min_order_amount", 0) or 0
+
+        # Tax / currency
+        tax_obj     = b2b.get("tax_code") or {}
+        tax_code    = tax_obj.get("tax_code","") if isinstance(tax_obj,dict) else str(tax_obj)
+        currency    = b2b.get("currency","SGD") or "SGD"
+        if isinstance(currency, dict): currency = currency.get("currency","SGD")
+
+        # Payment / sales
+        pm_obj       = b2b.get("payment_mode") or {}
+        payment_mode = pm_obj.get("payment_mode","") if isinstance(pm_obj,dict) else ""
+        sp_obj       = b2b.get("sales_person") or {}
+        sales_person = sp_obj.get("username","") if isinstance(sp_obj,dict) else ""
+
+        # Contact info
+        phone = c.get("customer_phone","") or c.get("phone","")
+        email = c.get("customer_email","") or c.get("email","")
+
+        db.execute("""INSERT OR REPLACE INTO customers (
+            customer_id, customer_code, customer_name, customer_type,
+            phone, email, uen,
+            store_id, store, branch_id, branch_name,
+            address, credit_term, credit_term_id, price_tier,
+            outstanding_amount, max_credit_limit, min_order_amount,
+            tax_code, currency, status, billing_id, payment_mode, sales_person,
+            b2b_stores, raw, synced_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))""",
+        (
+            cid,
+            cid,  # customer_code same as customer_id display code
+            name,
+            c.get("customer_type",""),
+            phone, email,
+            c.get("customer_uen",""),
+            store_id, name, branch_id, branch_name,
+            json.dumps(c.get("address",{})),
+            credit_term, credit_term_id, price_tier,
+            outstanding, max_credit, min_order,
+            tax_code, currency,
+            c.get("status","Active"),
+            c.get("billing_id",""),
+            payment_mode, sales_person,
+            json.dumps(stores),
+            json.dumps(c),
+        ))
     db.commit(); db.close()
     logger.info("Upserted %d customers", len(customers))
 
@@ -248,14 +294,37 @@ def db_upsert_products(products: List[Dict]):
 def db_upsert_orders(orders: List[Dict]):
     db = get_db()
     for o in orders:
-        db.execute("""INSERT OR REPLACE INTO orders
-            (order_id,order_number,customer_id,store_id,status,total_amount,delivery_date,chat_id,raw,synced_at)
-            VALUES(?,?,?,?,?,?,?,?,?,datetime('now'))""",
-            (o.get("order_id",""), o.get("order_number",""),
-             o.get("customer_id",""), o.get("store_id",""),
-             o.get("order_status",""), o.get("total_amount",0),
-             o.get("delivery_date",""), o.get("whatsapp_contact_id",""),
-             json.dumps(o)))
+        db.execute("""INSERT OR REPLACE INTO orders (
+            order_id, order_number, customer_id, store_id, store,
+            branch_id, branch_name, status, paid_status,
+            delivery_date, delivery_type,
+            item_total, tax_amount, total_amount, items_count,
+            item_info, chat_id, platform, source, created_by,
+            raw, synced_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))""",
+        (
+            o.get("order_id","") or o.get("_id",""),
+            o.get("order_number",""),
+            o.get("customer_id","") or o.get("store_id",""),
+            o.get("store_id",""),
+            o.get("store",""),
+            o.get("branch_id",""),
+            o.get("branch_name",""),
+            o.get("order_status",""),
+            o.get("paid_status",""),
+            o.get("delivery_date",""),
+            o.get("delivery_type","Delivery"),
+            o.get("item_total",0),
+            o.get("tax_amount",0),
+            o.get("total_amount",0),
+            o.get("items_count",0),
+            json.dumps(o.get("item_info",[])),
+            o.get("whatsapp_contact_id","") or o.get("chat_id",""),
+            o.get("platform",""),
+            o.get("source",""),
+            o.get("created_by",""),
+            json.dumps(o),
+        ))
     db.commit(); db.close()
 
 # ─── Global state ─────────────────────────────────────────────────────────────
@@ -1498,6 +1567,57 @@ async def get_stats():
     return stats
 
 # ─── Assignments ──────────────────────────────────────────────────────────────
+@app.get("/data/customer/{customer_id}/orders")
+async def get_customer_orders(customer_id: str, page: int = 1, per_page: int = 20):
+    """Get order history for a customer."""
+    db = get_db()
+    total = db.execute("SELECT COUNT(*) FROM orders WHERE customer_id=? OR store_id=?",
+                       (customer_id, customer_id)).fetchone()[0]
+    rows = db.execute("""SELECT order_id, order_number, store, branch_name, status, paid_status,
+        delivery_date, item_total, tax_amount, total_amount, items_count, item_info,
+        platform, created_by, synced_at
+        FROM orders WHERE customer_id=? OR store_id=?
+        ORDER BY delivery_date DESC LIMIT ? OFFSET ?""",
+        (customer_id, customer_id, per_page, (page-1)*per_page)).fetchall()
+    db.close()
+    orders = []
+    for r in rows:
+        d = dict(r)
+        try: d["item_info"] = json.loads(d.get("item_info") or "[]")
+        except: d["item_info"] = []
+        orders.append(d)
+
+    # Also try to sync latest orders from SNC
+    if total == 0:
+        asyncio.create_task(_sync_orders_for_customer(customer_id))
+
+    return {"orders": orders, "total": total, "page": page, "per_page": per_page}
+
+
+async def _sync_orders_for_customer(customer_id: str):
+    """Background sync of orders for a specific customer."""
+    result = await snc_call("/b2b/orders/get", {"data": {"include_orders": True, "filter_by": {
+        "source": "B2B", "platform": "Whatsapp",
+        "store_id": [customer_id], "branch_id": [], "status": "All",
+        "date_range": [
+            (datetime.now() - timedelta(days=365)).strftime("%d-%m-%Y"),
+            datetime.now().strftime("%d-%m-%Y"),
+        ],
+        "search_on": ["order_number","store"], "search_text": "",
+        "exact_match": False,
+        "pagination": {"page_no":1,"no_of_recs":50,"sort_by":"order_cts","order_by":False},
+        "packer_id":"","sales_person_id":"","date_range_by":"order_cts",
+        "warehouse_id":"All","tags":[],"whatsapp_contact_id":[],"review_required":False,
+    }}})
+    if result:
+        r    = result.get("result",{})
+        meta = r.get("metadata",{})
+        orders = meta.get("OrderList") or meta.get("orders") or []
+        if orders:
+            db_upsert_orders(orders)
+            logger.info("Synced %d orders for customer %s", len(orders), customer_id)
+
+
 @app.get("/data/customer/{customer_id}/branches")
 async def get_customer_branches(customer_id: str):
     """Get branches for a customer from DB or SNC."""
