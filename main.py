@@ -889,6 +889,41 @@ async def serve_frontend():
     if html_file.exists(): return HTMLResponse(content=html_file.read_text())
     return HTMLResponse(content="<h2>✓ oneaether.ai running</h2>")
 
+@app.get("/debug/customers-with-branches")
+async def debug_customers_with_branches():
+    """Show all customers that have a valid store_id and branch_id."""
+    db = get_db()
+    rows = db.execute("SELECT customer_id, customer_name, store_id, branch_id, branch_name, raw FROM customers").fetchall()
+    db.close()
+    with_branches = []
+    without = []
+    for r in rows:
+        try:
+            raw = json.loads(r["raw"] or "{}")
+            b2b = raw.get("b2b_settings",{})
+            stores = b2b.get("stores",[])
+            has_store = bool(r["store_id"] or stores)
+            entry = {
+                "customer_id":   r["customer_id"],
+                "customer_name": r["customer_name"],
+                "store_id":      r["store_id"],
+                "branch_id":     r["branch_id"],
+                "stores_in_b2b": len(stores),
+            }
+            if has_store:
+                with_branches.append(entry)
+            else:
+                without.append(r["customer_name"])
+        except:
+            pass
+    return {
+        "with_branches_count": len(with_branches),
+        "without_branches_count": len(without),
+        "customers_with_branches": with_branches[:20],
+        "customers_without": without[:10],
+    }
+
+
 @app.get("/debug/customer-raw/{customer_id}")
 async def debug_customer_raw(customer_id: str):
     """Show raw customer record from our DB."""
@@ -912,30 +947,40 @@ async def debug_customer_raw(customer_id: str):
     }
 
 
-@app.get("/debug/wa-contact/{phone}")
-async def debug_wa_contact(phone: str):
-    """Get real store_id/branch_id for a WhatsApp contact from SNC."""
-    # Strip non-digits
-    clean_phone = phone.replace("@s.whatsapp.net","").replace("@g.us","").replace("+","")
-    result = await snc_call("/whatsapp/contacts/get", {"data": {"filter_by": {
-        "phone_number": clean_phone,
-        "search_text": "",
-        "exact_match": False,
-        "pagination": {"page_no":1,"no_of_recs":5,"sort_by":"timestamp","order_by":False},
-        "include_columns": []
+@app.get("/debug/find-branch/{customer_id}")
+async def debug_find_branch(customer_id: str):
+    """Try every possible SNC endpoint to find branch_id for a customer."""
+    results = {}
+    # Try customers/get with include_columns for stores
+    r1 = await snc_call("/customers/get", {"data": {"filter_by": {
+        "search_on": ["customer_id"], "search_text": customer_id,
+        "exact_match": True,
+        "pagination": {"page_no":1,"no_of_recs":1,"sort_by":"cts","order_by":False},
+        "include_columns": ["stores","branches","outlets","b2b_settings","customer_id","customer_name"],
     }}})
-    if not result:
-        return {"error": "snc_call failed", "phone": clean_phone}
-    r    = result.get("result",{})
-    meta = r.get("metadata",{})
-    # Full dump to see structure
-    return {
-        "phone_used":  clean_phone,
-        "result_keys": list(r.keys()),
-        "meta_keys":   list(meta.keys()),
-        "meta_sample": str(meta)[:800],
-        "full_result": str(result)[:1200],
-    }
+    if r1:
+        meta = r1.get("result",{}).get("metadata",{})
+        cl = meta.get("CustomersList",[])
+        if cl:
+            c = cl[0]
+            b2b = c.get("b2b_settings",{})
+            results["customer_stores"] = c.get("stores",[])
+            results["b2b_stores"] = b2b.get("stores",[])
+            results["b2b_branches"] = b2b.get("branches",[])
+            results["all_b2b_keys"] = list(b2b.keys())
+            results["raw_customer"] = str(c)[:600]
+
+    # Try dedicated branch endpoints
+    for ep, body in [
+        ("/b2b/branches/get",  {"data": {"customer_id": customer_id}}),
+        ("/branch/list",       {"data": {"customer_id": customer_id}}),
+        ("/customer/branches", {"data": {"customer_id": customer_id}}),
+        ("/b2b/store/get",     {"data": {"customer_id": customer_id}}),
+    ]:
+        r = await snc_call(ep, body)
+        results[ep] = str(r)[:200] if r else "None/404"
+
+    return results
 
 
 @app.get("/debug/customer-branches/{customer_id}")
