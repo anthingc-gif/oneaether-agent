@@ -36,6 +36,23 @@ def get_db():
 
 def init_db():
     db = get_db()
+    # Migrate: drop old tables if schema changed (detected by missing columns)
+    try:
+        cols = [r[1] for r in db.execute("PRAGMA table_info(customers)").fetchall()]
+        if "price_tier" not in cols or "outstanding_amount" not in cols:
+            logger.info("Migrating customers table to new schema...")
+            db.execute("DROP TABLE IF EXISTS customers")
+            db.commit()
+    except Exception as e:
+        logger.warning("Migration check failed: %s", e)
+    try:
+        cols = [r[1] for r in db.execute("PRAGMA table_info(orders)").fetchall()]
+        if "item_info" not in cols or "paid_status" not in cols:
+            logger.info("Migrating orders table to new schema...")
+            db.execute("DROP TABLE IF EXISTS orders")
+            db.commit()
+    except Exception as e:
+        logger.warning("Orders migration check failed: %s", e)
     db.executescript("""
         CREATE TABLE IF NOT EXISTS credentials (
             key   TEXT PRIMARY KEY,
