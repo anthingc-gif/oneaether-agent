@@ -1436,6 +1436,21 @@ async def credentials_status():
     }
 
 # ─── Sync routes ──────────────────────────────────────────────────────────────
+@app.get("/debug/reset-db")
+async def debug_reset_db():
+    """Force drop and recreate customers and orders tables."""
+    db = get_db()
+    try:
+        db.execute("DROP TABLE IF EXISTS customers")
+        db.execute("DROP TABLE IF EXISTS orders")
+        db.commit()
+        db.close()
+        init_db()
+        return {"success": True, "message": "Tables dropped and recreated"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/debug/sync-now")
 async def debug_sync_now():
     """Run customer sync synchronously and return exact error."""
