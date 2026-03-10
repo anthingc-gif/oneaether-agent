@@ -1436,6 +1436,54 @@ async def credentials_status():
     }
 
 # ─── Sync routes ──────────────────────────────────────────────────────────────
+@app.get("/debug/sync-now")
+async def debug_sync_now():
+    """Run customer sync synchronously and return exact error."""
+    try:
+        result = await snc_call("/customers/get", {
+            "custom": True,
+            "data": {"filter_by": {
+                "company_id": SNC_HARDCODED_COMPANY,
+                "search_on": ["customer_name"],
+                "search_text": "", "exact_match": False,
+                "pagination": {"page_no": 1, "no_of_recs": 5, "sort_by": "cts", "order_by": False},
+            }}
+        })
+        if not result:
+            return {"error": "snc_call returned None"}
+
+        r    = result.get("result", {})
+        meta = r.get("metadata", {})
+        customers = meta.get("CustomersList", [])
+
+        if not customers:
+            return {"error": "No CustomersList in response", "meta_keys": list(meta.keys()), "result_keys": list(r.keys())}
+
+        # Try upserting first customer only
+        c = customers[0]
+        import traceback as tb
+        try:
+            db_upsert_customers([c])
+            upsert_ok = True
+            upsert_error = None
+        except Exception as e:
+            upsert_ok = False
+            upsert_error = tb.format_exc()
+
+        return {
+            "snc_returned": len(customers),
+            "first_customer_keys": list(c.keys()),
+            "first_customer_id": c.get("customer_id"),
+            "first_customer_name": c.get("customer_name"),
+            "b2b_keys": list((c.get("b2b_settings") or {}).keys()),
+            "upsert_ok": upsert_ok,
+            "upsert_error": upsert_error,
+        }
+    except Exception as e:
+        import traceback as tb
+        return {"error": str(e), "traceback": tb.format_exc()}
+
+
 @app.get("/debug/sync-test")
 async def debug_sync_test():
     """Test SNC connection and customer fetch."""
