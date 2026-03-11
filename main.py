@@ -1201,24 +1201,25 @@ async def debug_sync_products_now():
 
 @app.get("/debug/products-test")
 async def debug_products_test():
-    """Test SNC products fetch — see raw response structure."""
+    """Show raw SNC products response to find correct key."""
     result = await snc_call("/products/list", {"data": {"filter_by": {
-        "search_text": [], "search_on": ["name","sku"],
-        "confidence": 0.0, "exact_match": False,
+        "date_range": [], "search_on": ["name","sku","product_code"],
+        "confidence": 0.5, "search_text": [],
+        "exact_match": False,
         "pagination": {"page_no": 1, "no_of_recs": 3, "sort_by": "cts", "order_by": False},
-        "view": "individual", "status": "Active",
-        "include_columns": ["name","sku","prices","uom","uom_id","item_id"],
+        "view": "individual", "status": "All",
+        "include_columns": ["name","sku","prices","uom","base_uom","uom_id","item_id","tax_code","tax_code_id","tax_rate","b2b_enabled","status"],
         "merged": True, "bundles": False,
     }}})
     if not result:
-        return {"error": "snc_call returned None — check token/user_id"}
-    r = result.get("result", {})
+        return {"error": "snc_call returned None"}
+    r    = result.get("result", {})
     meta = r.get("metadata", {})
     return {
-        "result_keys":  list(r.keys()),
-        "metadata_keys": list(meta.keys()),
-        "data_type":    str(type(r.get("data"))),
-        "sample":       str(result)[:800],
+        "result_keys":    list(r.keys()),
+        "metadata_keys":  list(meta.keys()),
+        "meta_sample":    str(meta)[:1000],
+        "full_snippet":   str(result)[:1500],
     }
 
 
