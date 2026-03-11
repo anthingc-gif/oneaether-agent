@@ -278,7 +278,7 @@ def db_upsert_customers(customers: List[Dict]):
         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))""",
         (
             cid,
-            cid,  # customer_code same as customer_id display code
+            cid,
             name,
             c.get("customer_type",""),
             phone, email,
@@ -608,12 +608,9 @@ async def sync_products_from_snc(page: int = 1, per_page: int = 100) -> int:
         "exact_match": False,
         "pagination": {"page_no": page, "no_of_recs": per_page, "sort_by": "cts", "order_by": False},
         "view": "individual", "status": "All",
-        "include_columns": ["short_description","description","sku","short_name","name",
-            "parent_sku","product_code","category","sub_category","brand",
-            "uom","base_uom","prices","images","status","is_sellable","is_edited",
-            "b2b_enabled","pos_enabled","is_primary","merged_id","merged_skus",
-            "bom_type","linked_stores","inventory_type","quantity",
-            "uom_id","config","attribute_set"],
+        "include_columns": ["name","sku","short_name","uom","base_uom","prices",
+            "status","b2b_enabled","uom_id","item_id","tax_code","tax_code_id","tax_rate",
+            "product_code","category","quantity"],
         "merged": True, "bundles": False,
     }}})
     if not result:
@@ -622,23 +619,9 @@ async def sync_products_from_snc(page: int = 1, per_page: int = 100) -> int:
     r    = result.get("result", {})
     meta = r.get("metadata", {})
     # SNC returns products under various keys — try all
-    products = None
-    for key in ["ProductList","products","Items","item_list","data"]:
-        val = meta.get(key)
-        if val and isinstance(val, list):
-            products = val
-            break
-    if not products:
-        # fallback to result.data
-        d = r.get("data")
-        if isinstance(d, list):
-            products = d
-        elif isinstance(d, dict):
-            for key in ["ProductList","products","Items"]:
-                if d.get(key):
-                    products = d[key]
-                    break
-    if not products:
+    # SNC returns products under metadata.products
+    products = meta.get("products") or meta.get("ProductList") or meta.get("Items") or []
+    if not isinstance(products, list):
         products = []
     logger.info("sync_products page=%d found=%d meta_keys=%s", page, len(products), list(meta.keys()))
     if products:
@@ -797,24 +780,30 @@ async def push_order_to_snc(items: List[Dict], chat_id: str, delivery_date: str,
     company_id  = credentials["snc"].get("company_id","") or SNC_HARDCODED_COMPANY
     delivery    = delivery_date or (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
 
-    # Clean branch_id — "main" is a placeholder, not a real SNC ID
-    if branch_id in ("main", "Main Branch", ""):
+    # Resolve real branch_id from customers DB
+    if branch_id in ("main", "Main Branch", "", None):
         branch_id = ""
-        # Try to get real branch from customers DB
-        if store_id:
-            db = get_db()
-            row = db.execute("SELECT raw FROM customers WHERE customer_id=? OR store_id=?",
-                             (store_id, store_id)).fetchone()
-            db.close()
-            if row:
+    if not branch_id and store_id:
+        db = get_db()
+        row = db.execute(
+            "SELECT raw, branch_id, branch_name FROM customers WHERE customer_id=? OR store_id=?",
+            (store_id, store_id)).fetchone()
+        db.close()
+        if row:
+            # Try branch_id column first
+            if row["branch_id"]:
+                branch_id   = row["branch_id"]
+                branch_name = row["branch_name"] or branch_name
+                logger.info("Resolved branch from DB column: branch_id=%s", branch_id)
+            else:
+                # Parse raw to get branch_list
                 try:
-                    raw = json.loads(row["raw"])
-                    b2b = raw.get("b2b_settings") or {}
-                    stores = b2b.get("stores") or []
-                    if stores:
-                        branch_id   = stores[0].get("branch_id","")
-                        branch_name = stores[0].get("branch_name", branch_name)
-                        logger.info("Resolved branch from DB: branch_id=%s", branch_id)
+                    raw_data = json.loads(row["raw"] or "{}")
+                    bl = raw_data.get("branch_list") or []
+                    if bl:
+                        branch_id   = bl[0].get("branch_id","")
+                        branch_name = bl[0].get("branch_name", branch_name)
+                        logger.info("Resolved branch from branch_list: branch_id=%s", branch_id)
                 except Exception as e:
                     logger.warning("Branch resolve error: %s", e)
 
@@ -1286,22 +1275,22 @@ async def debug_test_order():
         "custom": True,
         "data": {"filter_by": {"customer_id": "121212", "company_id": SNC_HARDCODED_COMPANY}}
     })
-    store_id  = "121212"
-    branch_id = ""
+    store_id    = "121212"
+    branch_id   = ""
     branch_name = "Main Branch"
     if result:
         r    = result.get("result",{})
         meta = r.get("metadata",{})
         cl   = meta.get("CustomersList",[])
         if cl:
-            c       = cl[0]
-            store_id    = c.get("_id") or c.get("id") or c.get("customer_id","121212")
-            b2b         = c.get("b2b_settings",{})
-            stores      = b2b.get("stores",[])
-            if stores:
-                branch_id   = stores[0].get("branch_id","")
-                branch_name = stores[0].get("branch_name","Main Branch")
-            logger.info("iSTEAKS real IDs: store_id=%s branch_id=%s raw_keys=%s", store_id, branch_id, list(c.keys()))
+            c  = cl[0]
+            # branch_id is in branch_list, not b2b_settings.stores
+            bl = c.get("branch_list",[])
+            if bl:
+                branch_id   = bl[0].get("branch_id","")
+                branch_name = bl[0].get("branch_name","Main Branch")
+            store_id = c.get("customer_id","121212")
+            logger.info("iSTEAKS: store_id=%s branch_id=%s", store_id, branch_id)
 
     user_id    = SNC_HARDCODED_USER_ID
     username   = SNC_HARDCODED_USERNAME
