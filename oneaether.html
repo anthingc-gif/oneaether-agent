@@ -1039,8 +1039,15 @@ function CustomersScreen({ conn = {} }) {
           onKeyDown={e=>{ if(e.key==="Enter"){setPage(1);fetchCustomers(1,search);} }} />
         <button className="btn btn-ghost btn-sm" onClick={()=>{setPage(1);fetchCustomers(1,search);}}>🔍 Search</button>
         <button className="btn btn-primary btn-sm" onClick={syncFromSNC} disabled={syncing}>
-          {syncing ? "⏳ Syncing..." : "↻ Sync from SNC"}
+          {syncing ? "⏳ Syncing..." : "↻ Sync Customers"}
         </button>
+        <button className="btn btn-ghost btn-sm" onClick={async()=>{
+          const _ag = conn.agentUrl || window.AGENT_URL || "";
+          if(!_ag) return;
+          const r = await fetch(_ag+"/debug/sync-products-now");
+          const d = await r.json();
+          alert("Products synced: "+(d.synced||0)+" items. Total in DB: "+(d.total_in_db||0));
+        }}>↻ Sync Products</button>
         {lastSync && <span style={{fontSize:11,color:"var(--text2)"}}>Last sync: {lastSync}</span>}
       </div>
 
