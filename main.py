@@ -228,10 +228,11 @@ def db_upsert_customers(customers: List[Dict]):
         b2b   = c.get("b2b_settings") or {}
         stores = b2b.get("stores") or []
 
-        # Extract first store/branch
+        # branch_list has real branch IDs (different from b2b stores)
+        branch_list = c.get("branch_list") or []
         store_id    = (stores[0].get("store_id","")    if stores else "") or c.get("store_id","")
-        branch_id   = (stores[0].get("branch_id","")   if stores else "") or c.get("branch_id","")
-        branch_name = (stores[0].get("branch_name","") if stores else "") or c.get("branch_name","")
+        branch_id   = (branch_list[0].get("branch_id","") if branch_list else "") or                       (stores[0].get("branch_id","")   if stores else "") or c.get("branch_id","")
+        branch_name = (branch_list[0].get("branch_name","") if branch_list else "") or                       (stores[0].get("branch_name","") if stores else "") or c.get("branch_name","")
 
         # Credit term
         ct_obj      = b2b.get("credit_term") or {}
@@ -259,9 +260,12 @@ def db_upsert_customers(customers: List[Dict]):
         sp_obj       = b2b.get("sales_person") or {}
         sales_person = sp_obj.get("username","") if isinstance(sp_obj,dict) else ""
 
-        # Contact info
-        phone = c.get("customer_phone","") or c.get("phone","")
-        email = c.get("customer_email","") or c.get("email","")
+        # Contact info — from contacts_list
+        contacts_list = c.get("contacts_list") or []
+        first_contact = contacts_list[0] if contacts_list else {}
+        phone = c.get("customer_phone","") or c.get("phone","") or first_contact.get("phone","")
+        email = c.get("customer_email","") or c.get("email","") or first_contact.get("email","")
+        status = "Active" if c.get("is_active", True) else "Inactive"
 
         db.execute("""INSERT OR REPLACE INTO customers (
             customer_id, customer_code, customer_name, customer_type,
@@ -284,10 +288,10 @@ def db_upsert_customers(customers: List[Dict]):
             credit_term, credit_term_id, price_tier,
             outstanding, max_credit, min_order,
             tax_code, currency,
-            c.get("status","Active"),
+            status,
             c.get("billing_id",""),
             payment_mode, sales_person,
-            json.dumps(stores),
+            json.dumps({"stores": stores, "branch_list": branch_list}),
             json.dumps(c),
         ))
     db.commit(); db.close()
@@ -615,16 +619,27 @@ async def sync_products_from_snc(page: int = 1, per_page: int = 100) -> int:
     if not result:
         logger.error("sync_products: snc_call returned None")
         return 0
-    r = result.get("result", {})
+    r    = result.get("result", {})
     meta = r.get("metadata", {})
-    # Try all known SNC response paths
-    products = (
-        meta.get("ProductList") or meta.get("products") or meta.get("Items") or
-        r.get("data", {}).get("ProductList") if isinstance(r.get("data"), dict) else None or
-        (r.get("data") if isinstance(r.get("data"), list) else None) or
-        r.get("ProductList") or r.get("products") or []
-    )
-    if not isinstance(products, list): products = []
+    # SNC returns products under various keys — try all
+    products = None
+    for key in ["ProductList","products","Items","item_list","data"]:
+        val = meta.get(key)
+        if val and isinstance(val, list):
+            products = val
+            break
+    if not products:
+        # fallback to result.data
+        d = r.get("data")
+        if isinstance(d, list):
+            products = d
+        elif isinstance(d, dict):
+            for key in ["ProductList","products","Items"]:
+                if d.get(key):
+                    products = d[key]
+                    break
+    if not products:
+        products = []
     logger.info("sync_products page=%d found=%d meta_keys=%s", page, len(products), list(meta.keys()))
     if products:
         db_upsert_products(products)
@@ -1165,6 +1180,25 @@ async def debug_login_response():
         return {"error": str(e)}
 
 
+@app.get("/debug/sync-products-now")
+async def debug_sync_products_now():
+    """Sync 100 products and show result."""
+    try:
+        count = await sync_products_from_snc(page=1, per_page=100)
+        db = get_db()
+        total = db.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+        sample = db.execute("SELECT item_id,sku,name,uom,price FROM products LIMIT 3").fetchall()
+        db.close()
+        return {
+            "synced": count,
+            "total_in_db": total,
+            "sample": [dict(r) for r in sample],
+        }
+    except Exception as e:
+        import traceback
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+
 @app.get("/debug/products-test")
 async def debug_products_test():
     """Test SNC products fetch — see raw response structure."""
@@ -1625,19 +1659,15 @@ async def _sync_customers_task():
         page += 1
     logger.info("Customer sync COMPLETE: %d customers stored", total)
 
+@app.get("/sync/products")
 @app.post("/sync/products")
 async def sync_products(background_tasks: BackgroundTasks):
     background_tasks.add_task(_sync_products_task)
     return {"status":"syncing","message":"Product sync started in background"}
 
 async def _sync_products_task():
-    page=1; total=0
-    while True:
-        count = await sync_products_from_snc(page=page, per_page=100)
-        total += count
-        if count < 100: break
-        page += 1
-    logger.info("Product sync complete: %d total", total)
+    count = await sync_products_from_snc(page=1, per_page=100)
+    logger.info("Product sync complete: %d products", count)
 
 @app.post("/sync/orders")
 async def sync_orders(background_tasks: BackgroundTasks):
