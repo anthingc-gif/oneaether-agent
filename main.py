@@ -1438,17 +1438,78 @@ async def credentials_status():
 # ─── Sync routes ──────────────────────────────────────────────────────────────
 @app.get("/debug/reset-db")
 async def debug_reset_db():
-    """Force drop and recreate customers and orders tables."""
-    db = get_db()
+    """Force drop and recreate customers and orders tables with new schema."""
     try:
+        db = get_db()
         db.execute("DROP TABLE IF EXISTS customers")
         db.execute("DROP TABLE IF EXISTS orders")
         db.commit()
+
+        # Recreate with full new schema inline
+        db.execute("""CREATE TABLE IF NOT EXISTS customers (
+            customer_id   TEXT PRIMARY KEY,
+            customer_code TEXT,
+            customer_name TEXT,
+            customer_type TEXT,
+            phone         TEXT,
+            email         TEXT,
+            uen           TEXT,
+            store_id      TEXT,
+            store         TEXT,
+            branch_id     TEXT,
+            branch_name   TEXT,
+            address       TEXT,
+            credit_term   TEXT,
+            credit_term_id TEXT,
+            price_tier    TEXT,
+            outstanding_amount REAL DEFAULT 0,
+            max_credit_limit   REAL DEFAULT 0,
+            min_order_amount   REAL DEFAULT 0,
+            tax_code      TEXT,
+            currency      TEXT,
+            status        TEXT,
+            billing_id    TEXT,
+            payment_mode  TEXT,
+            sales_person  TEXT,
+            b2b_stores    TEXT,
+            raw           TEXT,
+            synced_at     TEXT
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS orders (
+            order_id      TEXT PRIMARY KEY,
+            order_number  TEXT,
+            customer_id   TEXT,
+            store_id      TEXT,
+            store         TEXT,
+            branch_id     TEXT,
+            branch_name   TEXT,
+            status        TEXT,
+            paid_status   TEXT,
+            delivery_date TEXT,
+            delivery_type TEXT,
+            item_total    REAL DEFAULT 0,
+            tax_amount    REAL DEFAULT 0,
+            total_amount  REAL DEFAULT 0,
+            items_count   INTEGER DEFAULT 0,
+            item_info     TEXT,
+            chat_id       TEXT,
+            platform      TEXT,
+            source        TEXT,
+            created_by    TEXT,
+            raw           TEXT,
+            synced_at     TEXT
+        )""")
+        db.commit()
         db.close()
-        init_db()
-        return {"success": True, "message": "Tables dropped and recreated"}
+
+        # Verify columns
+        db2 = get_db()
+        cols = [r[1] for r in db2.execute("PRAGMA table_info(customers)").fetchall()]
+        db2.close()
+        return {"success": True, "columns": cols}
     except Exception as e:
-        return {"error": str(e)}
+        import traceback
+        return {"error": str(e), "traceback": traceback.format_exc()}
 
 
 @app.get("/debug/sync-now")
