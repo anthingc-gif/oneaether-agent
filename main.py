@@ -1068,6 +1068,36 @@ async def debug_customer_raw(customer_id: str):
     }
 
 
+@app.get("/debug/isteaks-full")
+async def debug_isteaks_full():
+    """Get complete iSTEAKS record from SNC to find branch_id and internal IDs."""
+    # Try custom=True which returns full data including internal IDs
+    result = await snc_call("/customers/get", {
+        "custom": True,
+        "data": {"filter_by": {"customer_id": "121212", "company_id": "mindmasters"}}
+    })
+    if not result:
+        return {"error": "No result"}
+    r    = result.get("result", {})
+    meta = r.get("metadata", {})
+    cl   = meta.get("CustomersList", [])
+    if not cl:
+        return {"meta_keys": list(meta.keys()), "raw": str(result)[:1000]}
+    c   = cl[0]
+    b2b = c.get("b2b_settings", {})
+    return {
+        "all_keys":      list(c.keys()),
+        "customer_id":   c.get("customer_id"),
+        "_id":           c.get("_id"),
+        "id":            c.get("id"),
+        "erp_id":        c.get("erp_id"),
+        "branch_list":   c.get("branch_list", []),
+        "b2b_stores":    b2b.get("stores", []),
+        "b2b_keys":      list(b2b.keys()),
+        "raw_snippet":   str(c)[:800],
+    }
+
+
 @app.get("/debug/find-branch/{customer_id}")
 async def debug_find_branch(customer_id: str):
     """Try every possible SNC endpoint to find branch_id for a customer."""
@@ -1197,6 +1227,31 @@ async def debug_sync_products_now():
     except Exception as e:
         import traceback
         return {"error": str(e), "traceback": traceback.format_exc()}
+
+
+@app.get("/debug/products-with-relation/{relation_id}")
+async def debug_products_with_relation(relation_id: str):
+    """Test products fetch with a specific relation_id (customer internal ID)."""
+    result = await snc_call("/products/list", {"data": {"filter_by": {
+        "date_range": [], "search_on": ["name","sku","product_code"],
+        "confidence": 0.5, "search_text": [],
+        "relation_id": relation_id,
+        "exact_match": False,
+        "pagination": {"page_no": 1, "no_of_recs": 5, "sort_by": "cts", "order_by": False},
+        "view": "individual", "status": "All",
+        "include_columns": ["name","sku","prices","uom","uom_id","item_id","tax_code","tax_code_id","tax_rate"],
+        "merged": True, "bundles": False,
+    }}})
+    if not result:
+        return {"error": "snc_call returned None"}
+    r    = result.get("result", {})
+    meta = r.get("metadata", {})
+    prods = meta.get("products", [])
+    return {
+        "count":       meta.get("count", 0),
+        "meta_keys":   list(meta.keys()),
+        "sample":      prods[:2],
+    }
 
 
 @app.get("/debug/products-test")
