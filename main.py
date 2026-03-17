@@ -657,26 +657,40 @@ async def sync_products_from_snc(page: int = 1, per_page: int = 100) -> int:
     """Pull all products from SNC and store in DB."""
     # Postman: relation_id is a customer's customer_id, used to filter by customer
     # Without relation_id, pass empty string to get all products
-    # relation_id must be a numeric customer code (e.g. "121212"), not an order number
-    # SNC customer_id field is the display code like "121212" or "TEST_CUST004"
+    # relation_id in Postman is "11001058" — an ERP store/relation ID stored in raw customer data
+    # Try to find it from raw customer data (erp_id or store reference number)
     relation_id = ""
     try:
         _db = get_db()
-        # Pick customer whose ID looks like a numeric/short code (not order numbers like MIN-032026-*)
-        _r = _db.execute("""SELECT customer_id FROM customers
-            WHERE customer_id NOT LIKE '%-%-%'
-            AND customer_id NOT LIKE 'TEST%'
-            AND branch_id != ''
-            LIMIT 1""").fetchone()
-        if not _r:
-            _r = _db.execute("""SELECT customer_id FROM customers
-                WHERE customer_id NOT LIKE '%-%-%'
-                LIMIT 1""").fetchone()
-        if not _r:
-            _r = _db.execute("SELECT customer_id FROM customers LIMIT 1").fetchone()
+        rows = _db.execute("SELECT customer_id, raw FROM customers WHERE raw IS NOT NULL LIMIT 20").fetchall()
         _db.close()
-        if _r: relation_id = _r["customer_id"]
+        for row in rows:
+            try:
+                raw = json.loads(row["raw"])
+                # Check erp_id, erp_tenant_name, and nested store IDs
+                erp = raw.get("erp_id") or raw.get("erp_tenant_name")
+                if erp and str(erp).isdigit():
+                    relation_id = str(erp)
+                    break
+                # Check branch_list for netsuite_internal_id
+                bl = raw.get("branch_list") or []
+                for b in bl:
+                    nid = b.get("netsuite_internal_id")
+                    if nid and str(nid).isdigit():
+                        relation_id = str(nid)
+                        break
+                if relation_id:
+                    break
+                # Fall back to numeric customer_id
+                cid = row["customer_id"]
+                if cid and cid.replace("-","").isdigit():
+                    relation_id = cid
+                    break
+            except: pass
     except: pass
+    # Final fallback: use iSTEAKS known ID
+    if not relation_id:
+        relation_id = "121212"
     logger.info("sync_products: using relation_id=%s", relation_id)
 
     result = await snc_call("/products/list", {"data": {"filter_by": {
@@ -688,9 +702,13 @@ async def sync_products_from_snc(page: int = 1, per_page: int = 100) -> int:
         "exact_match": False,
         "pagination": {"page_no": page, "no_of_recs": per_page, "sort_by": "cts", "order_by": False},
         "view": "individual", "status": "All",
-        "include_columns": ["name","sku","short_name","uom","base_uom","prices",
-            "status","b2b_enabled","uom_id","item_id","tax_code","tax_code_id","tax_rate",
-            "product_code","category","quantity"],
+        "include_columns": [
+            "short_description","description","sku","short_name","name",
+            "parent_sku","product_code","category","sub_category","brand",
+            "uom","base_uom","prices","images","status","is_sellable","is_edited",
+            "b2b_enabled","pos_enabled","is_primary","merged_id","merged_skus",
+            "bom_type","linked_stores","inventory_type","quantity","uom_id","config","attribute_set"
+        ],
         "merged": True, "bundles": False,
     }}})
     if not result:
@@ -1364,11 +1382,7 @@ async def debug_login_response():
 async def debug_sync_products_now():
     """Sync 100 products and show result."""
     try:
-        # Show what relation_id will be used
-        _db = get_db()
-        _row = _db.execute("SELECT customer_id, customer_name FROM customers LIMIT 1").fetchone()
-        _db.close()
-        relation_id_used = _row["customer_id"] if _row else "NONE - sync customers first!"
+        relation_id_used = SNC_RELATION_ID
 
         count = await sync_products_from_snc(page=1, per_page=100)
         db = get_db()
@@ -1384,6 +1398,28 @@ async def debug_sync_products_now():
     except Exception as e:
         import traceback
         return {"error": str(e), "traceback": traceback.format_exc()}
+
+
+@app.get("/debug/products-relation-ids")
+async def debug_products_relation_ids():
+    """Show what relation IDs we have and test each format."""
+    db = get_db()
+    rows = db.execute("SELECT customer_id, customer_name, raw FROM customers LIMIT 10").fetchall()
+    db.close()
+    results = []
+    for r in rows:
+        raw = {}
+        try: raw = json.loads(r["raw"] or "{}")
+        except: pass
+        bl = raw.get("branch_list") or []
+        results.append({
+            "customer_id":    r["customer_id"],
+            "customer_name":  r["customer_name"],
+            "erp_id":         raw.get("erp_id"),
+            "erp_tenant_name":raw.get("erp_tenant_name"),
+            "netsuite_ids":   [b.get("netsuite_internal_id") for b in bl],
+        })
+    return {"customers": results}
 
 
 @app.get("/debug/products-with-relation/{relation_id}")
