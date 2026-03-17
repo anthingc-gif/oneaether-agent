@@ -53,6 +53,14 @@ def init_db():
             db.commit()
     except Exception as e:
         logger.warning("Orders migration check failed: %s", e)
+    try:
+        cols = [r[1] for r in db.execute("PRAGMA table_info(products)").fetchall()]
+        if "base_uom" not in cols:
+            logger.info("Migrating products table to new schema...")
+            db.execute("DROP TABLE IF EXISTS products")
+            db.commit()
+    except Exception as e:
+        logger.warning("Products migration check failed: %s", e)
     db.executescript("""
         CREATE TABLE IF NOT EXISTS credentials (
             key   TEXT PRIMARY KEY,
@@ -299,16 +307,44 @@ def db_upsert_customers(customers: List[Dict]):
 
 def db_upsert_products(products: List[Dict]):
     db = get_db()
+    # Add missing columns if needed
+    existing = [r[1] for r in db.execute("PRAGMA table_info(products)").fetchall()]
+    for col, defn in [
+        ("short_name","TEXT"), ("base_uom","TEXT"), ("base_uom_id","TEXT"),
+        ("product_code","TEXT"), ("category","TEXT"), ("quantity","REAL"),
+    ]:
+        if col not in existing:
+            db.execute(f"ALTER TABLE products ADD COLUMN {col} {defn}")
+    db.commit()
+
     for p in products:
-        prices = p.get("prices", [])
-        price  = prices[0].get("price", 0) if prices else 0
+        prices = p.get("prices") or []
+        price  = float(prices[0].get("price",0)) if prices else 0.0
+
+        # tax info can be nested dict or flat
+        tc_raw     = p.get("tax_code") or {}
+        tax_code   = tc_raw.get("tax_code","SR9") if isinstance(tc_raw,dict) else str(tc_raw)
+        tax_code_id= tc_raw.get("tax_code_id","") if isinstance(tc_raw,dict) else p.get("tax_code_id","")
+        tax_rate   = float(tc_raw.get("tax_rate",9) if isinstance(tc_raw,dict) else p.get("tax_rate",9) or 9)
+
+        # uom_id
+        uom_id = p.get("uom_id","")
+        if isinstance(uom_id, dict): uom_id = uom_id.get("uom_id","")
+
         db.execute("""INSERT OR REPLACE INTO products
-            (item_id,sku,name,uom,uom_id,price,tax_rate,tax_code,tax_code_id,status,raw,synced_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,datetime('now'))""",
-            (p.get("item_id",""), p.get("sku",""), p.get("name",""),
-             p.get("uom",""), p.get("uom_id",""), price,
-             p.get("tax_rate",9), p.get("tax_code","SR9"),
-             p.get("tax_code_id",""), p.get("status","Active"), json.dumps(p)))
+            (item_id,sku,name,short_name,uom,base_uom,uom_id,
+             price,tax_rate,tax_code,tax_code_id,
+             product_code,category,quantity,status,raw,synced_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))""",
+            (
+                p.get("item_id",""), p.get("sku",""),
+                p.get("name",""), p.get("short_name",""),
+                p.get("uom",""), p.get("base_uom",""), uom_id,
+                price, tax_rate, tax_code, tax_code_id,
+                p.get("product_code",""), p.get("category",""),
+                float(p.get("quantity",0) or 0),
+                p.get("status","Active"), json.dumps(p),
+            ))
     db.commit(); db.close()
     logger.info("Upserted %d products", len(products))
 
@@ -600,8 +636,11 @@ async def sync_customers_from_snc(page: int = 1, per_page: int = 100) -> int:
 
 async def sync_products_from_snc(page: int = 1, per_page: int = 100) -> int:
     """Pull all products from SNC and store in DB."""
+    # Postman: relation_id is a customer's customer_id, used to filter by customer
+    # Without relation_id, pass empty string to get all products
     result = await snc_call("/products/list", {"data": {"filter_by": {
         "date_range": [],
+        "relation_id": "",
         "search_on": ["name","sku","product_code"],
         "confidence": 0.5,
         "search_text": [],
@@ -807,6 +846,41 @@ async def push_order_to_snc(items: List[Dict], chat_id: str, delivery_date: str,
                 except Exception as e:
                     logger.warning("Branch resolve error: %s", e)
 
+    # Get credit_term from customer DB (required by Postman payload)
+    credit_term    = {}
+    delivery_addr  = {}
+    billing_addr   = {}
+    if store_id:
+        db = get_db()
+        crow = db.execute("SELECT raw FROM customers WHERE customer_id=?", (store_id,)).fetchone()
+        db.close()
+        if crow:
+            try:
+                craw = json.loads(crow["raw"] or "{}")
+                b2b  = craw.get("b2b_settings") or {}
+                ct   = b2b.get("credit_term") or {}
+                if ct: credit_term = ct
+                # Get address from branch_list
+                bl = craw.get("branch_list") or []
+                if bl:
+                    ba = bl[0].get("billing_address") or {}
+                    sa = bl[0].get("shipping_address") or {}
+                    if ba:
+                        billing_addr = {
+                            "address1": ba.get("address1",""), "address2": ba.get("address2"),
+                            "city": ba.get("city"), "state": ba.get("state"),
+                            "country": ba.get("country","Singapore"),
+                            "postal_code": ba.get("postal_code",""),
+                        }
+                    if sa:
+                        delivery_addr = {
+                            "address1": sa.get("address1",""), "address2": sa.get("address2"),
+                            "city": sa.get("city"), "state": sa.get("state"),
+                            "country": sa.get("country","Singapore"),
+                            "postal_code": sa.get("postal_code",""),
+                        }
+            except: pass
+
     item_info  = []
     item_total = 0.0
     tax_total  = 0.0
@@ -864,13 +938,35 @@ async def push_order_to_snc(items: List[Dict], chat_id: str, delivery_date: str,
         "start_period": None, "end_period": None, "default": True,
     }
 
+    # Pull full customer data for credit_term + address
+    cust_raw = {}
+    try:
+        _db = get_db()
+        _row = _db.execute("SELECT raw FROM customers WHERE customer_id=?", (store_id,)).fetchone()
+        _db.close()
+        if _row: cust_raw = json.loads(_row["raw"] or "{}")
+    except: pass
+
+    b2b         = cust_raw.get("b2b_settings") or {}
+    ct_obj      = b2b.get("credit_term") or {}
+    bl          = cust_raw.get("branch_list") or []
+    ship_addr   = bl[0].get("shipping_address",{}) if bl else {}
+    bill_addr   = bl[0].get("billing_address",{})  if bl else {}
+    ship_addr_id = ship_addr.get("address_id","")
+    bill_addr_id = bill_addr.get("address_id","")
+    currency_val = b2b.get("currency","SGD")
+    if isinstance(currency_val, dict): currency_val = currency_val.get("currency","SGD")
+
     order_payload = {
         "company_id": company_id, "source": "B2B", "platform": "Whatsapp",
+        "invoice_number": order_number,
         "store_id": store_id, "store": store,
         "branch_id": branch_id, "branch_name": branch_name,
         "slot_info": slot_info,
-        "currency": "SGD", "items_count": len(item_info),
+        "currency": currency_val or "SGD",
+        "items_count": len(item_info),
         "order_status": "Pending", "paid_status": "Pending",
+        "credit_term": ct_obj,
         "delivery_type": "Delivery", "delivery_date": delivery,
         "item_total": round(item_total, 5),
         "tax_amount": round(tax_total, 5),
@@ -878,11 +974,35 @@ async def push_order_to_snc(items: List[Dict], chat_id: str, delivery_date: str,
         "created_by": username, "updated_by": username,
         "created_by_id": user_id, "user_id": user_id, "user_name": username,
         "item_info": item_info,
-        "discount_info": {"discount_type":"% Discount","discount":0,"discount_amount":0,"discount_id":None,"discount_name":None,"deal_id":None,"deal_name":None,"coupon_code":None},
-        "coupon_info":   {"discount_type":"% Discount","discount":0,"discount_amount":0,"discount_id":None,"discount_name":None,"deal_id":None,"deal_name":None,"coupon_code":None},
-        "free_shipping": False, "payment_info": [], "applied_credit_notes": [],
-        "advance_amount": 0, "delivery_charges": 0, "tax_inclusive": False,
+        "tax_code": {"tax_code":"SR9","tax_rate":9,"tax_code_id":"r4L4SqU4QSmMqU3EsOYJtg",
+            "to_date":None,"from_date":"2024-01-01 05:30:00","description":"SR9",
+            "is_deleted":False,"_SNCBaseObject__api_version":"TaxCodes","_SNCBaseObject__type":"1.0"},
+        "tax_inclusive": False,
+        "discount_info": {"discount_type":"% Discount","discount":0,"discount_amount":0,
+            "discount_id":None,"discount_name":None,"deal_id":None,"deal_name":None,"coupon_code":None},
+        "coupon_info": {"discount_type":"% Discount","discount":0,"discount_amount":0,
+            "discount_id":None,"discount_name":None,"deal_id":None,"deal_name":None,"coupon_code":None},
         "installation_info": {"installation":False,"installation_date":None,"installation_charges":0},
+        "free_shipping": False, "payment_info": [], "applied_credit_notes": [],
+        "advance_amount": 0, "delivery_charges": 0,
+        "delivery_address_id":   ship_addr_id,
+        "delivery_address_info": {
+            "address1":    ship_addr.get("address1",""),
+            "address2":    ship_addr.get("address2",None),
+            "city":        ship_addr.get("city",None),
+            "state":       ship_addr.get("state",None),
+            "country":     ship_addr.get("country","Singapore"),
+            "postal_code": ship_addr.get("postal_code",""),
+        },
+        "billing_address_id":   bill_addr_id,
+        "billing_address_info": {
+            "address1":    bill_addr.get("address1",""),
+            "address2":    bill_addr.get("address2",None),
+            "city":        bill_addr.get("city",None),
+            "state":       bill_addr.get("state",None),
+            "country":     bill_addr.get("country","Singapore"),
+            "postal_code": bill_addr.get("postal_code",""),
+        },
         "whatsapp_contact_id": chat_id,
     }
 
@@ -1203,12 +1323,19 @@ async def debug_login_response():
 async def debug_sync_products_now():
     """Sync 100 products and show result."""
     try:
+        # Show what relation_id will be used
+        _db = get_db()
+        _row = _db.execute("SELECT customer_id, customer_name FROM customers LIMIT 1").fetchone()
+        _db.close()
+        relation_id_used = _row["customer_id"] if _row else "NONE - sync customers first!"
+
         count = await sync_products_from_snc(page=1, per_page=100)
         db = get_db()
         total = db.execute("SELECT COUNT(*) FROM products").fetchone()[0]
-        sample = db.execute("SELECT item_id,sku,name,uom,price FROM products LIMIT 3").fetchall()
+        sample = db.execute("SELECT item_id,sku,name,uom,uom_id,base_uom,base_uom_id,price,tax_code,tax_rate FROM products LIMIT 5").fetchall()
         db.close()
         return {
+            "relation_id_used": relation_id_used,
             "synced": count,
             "total_in_db": total,
             "sample": [dict(r) for r in sample],
@@ -1220,15 +1347,19 @@ async def debug_sync_products_now():
 
 @app.get("/debug/products-with-relation/{relation_id}")
 async def debug_products_with_relation(relation_id: str):
-    """Test products fetch with a specific relation_id (customer internal ID)."""
+    """Test products fetch with a specific relation_id (customer_id like 121212)."""
     result = await snc_call("/products/list", {"data": {"filter_by": {
-        "date_range": [], "search_on": ["name","sku","product_code"],
-        "confidence": 0.5, "search_text": [],
+        "date_range": [],
         "relation_id": relation_id,
+        "search_on": ["name","sku","product_code"],
+        "confidence": 0.5, "search_text": [],
         "exact_match": False,
         "pagination": {"page_no": 1, "no_of_recs": 5, "sort_by": "cts", "order_by": False},
         "view": "individual", "status": "All",
-        "include_columns": ["name","sku","prices","uom","uom_id","item_id","tax_code","tax_code_id","tax_rate"],
+        "include_columns": ["short_description","description","sku","short_name","name",
+            "parent_sku","product_code","category","sub_category","brand",
+            "uom","base_uom","prices","images","status","is_sellable",
+            "b2b_enabled","uom_id","config","attribute_set"],
         "merged": True, "bundles": False,
     }}})
     if not result:
@@ -1237,9 +1368,10 @@ async def debug_products_with_relation(relation_id: str):
     meta = r.get("metadata", {})
     prods = meta.get("products", [])
     return {
-        "count":       meta.get("count", 0),
-        "meta_keys":   list(meta.keys()),
-        "sample":      prods[:2],
+        "count":      meta.get("count", 0),
+        "meta_keys":  list(meta.keys()),
+        "first_product_keys": list(prods[0].keys()) if prods else [],
+        "sample":     [{k: p.get(k) for k in ["item_id","name","sku","uom","uom_id","prices","b2b_enabled"]} for p in prods[:3]],
     }
 
 
