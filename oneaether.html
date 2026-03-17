@@ -1313,6 +1313,7 @@ function WhatsAppScreen({ conn = {} }) {
   const [assignChat, setAssignChat]   = useState(null);
   const [customers,  setCustomers]    = useState([]);
   const [branches,   setBranches]     = useState([]);
+  const [orderSuggestion, setOrderSuggestion] = useState(null); // {chatId, items, text}
   const [assignments, setAssignments] = useState({}); // chat_id → {customer, branch, customer_id, branch_id, store_id}
   const [assignLoading, setAssignLoading] = useState(false);
   const [groupMembers, setGroupMembers]   = useState({}); // chat_id → [members]
@@ -1410,6 +1411,28 @@ function WhatsAppScreen({ conn = {} }) {
     messages:[],
   });
 
+  const autoDetectOrder = async (chatId, msg) => {
+    const text = (msg.text || "").toLowerCase();
+    const orderKws = ["order","i want","i need","can i get","please send","want to order","boxes","packs","pcs","kg","units"];
+    if (!orderKws.some(kw => text.includes(kw))) return;
+    const items = [];
+    const raw = msg.text || "";
+    const parts = raw.split(/,|and/i);
+    parts.forEach(part => {
+      const m2 = part.trim().match(/^(\d+)\s*(boxes?|pcs?|packets?|pkts?|kgs?|units?|bags?)?\s+(?:of\s+)?(.+)/i);
+      if (m2) {
+        const name = m2[3].trim().replace(/[.,!?]+$/,"");
+        if (name.length > 2) items.push({ name, qty: parseInt(m2[1]), uom: m2[2] || "unit" });
+      }
+    });
+    if (items.length > 0) {
+      setOrderSuggestion({ chatId, items, text: msg.text, msgId: msg.id });
+      setChats(cs => cs.map(c => c.id === chatId ? {
+        ...c, messages: c.messages.map(x => x.id === msg.id ? {...x, intent: "NEW_ORDER"} : x)
+      } : c));
+    }
+  };
+
   const mapMsg = m => ({
     id:   m.id,
     from: m.from_me ? "us" : "them",
@@ -1498,6 +1521,13 @@ function WhatsAppScreen({ conn = {} }) {
         const mapped = [...msgsArr].reverse().map(mapMsg);
         setChats(cs => cs.map(c => c.id === chatId ? {...c, messages: mapped, unread: 0} : c));
         setLastFetch(new Date());
+        // Auto-detect orders in latest incoming messages
+        const latestIncoming = mapped.filter(m => m.from === "them").slice(-3);
+        for (const m of latestIncoming) {
+          if (m.text && m.text.length > 5 && !m.intent) {
+            autoDetectOrder(chatId, m);
+          }
+        }
       }
     } catch(e) { /* silent on message fetch fail — keep existing */ }
   };
@@ -1922,6 +1952,30 @@ function WhatsAppScreen({ conn = {} }) {
             )}
 
             <div className="wa-messages">
+              {/* Order auto-detection banner */}
+              {orderSuggestion && orderSuggestion.chatId === cur.id && (
+                <div style={{
+                  margin:"8px 12px",padding:"12px 14px",
+                  background:"#00d9a315",border:"1px solid #00d9a340",
+                  borderRadius:10,display:"flex",alignItems:"center",gap:10,flexShrink:0
+                }}>
+                  <span style={{fontSize:20}}>🛒</span>
+                  <div style={{flex:1}}>
+                    <div style={{fontWeight:700,color:"var(--accent)",fontSize:13}}>Order detected!</div>
+                    <div style={{fontSize:12,color:"var(--text2)",marginTop:2}}>
+                      {orderSuggestion.items.map(i=>`${i.qty} ${i.uom} ${i.name}`).join(", ")}
+                    </div>
+                  </div>
+                  <button className="btn btn-primary btn-sm" onClick={()=>{
+                    setCreateOrderChat(cur);
+                    setOrderItems(orderSuggestion.items.map(i=>({name:i.name,qty:i.qty,uom:i.uom||"unit"})));
+                    setShowCreateOrder(true);
+                    setOrderSuggestion(null);
+                  }}>Create Order</button>
+                  <button className="btn btn-ghost btn-sm" style={{fontSize:18,padding:"2px 8px"}}
+                    onClick={()=>setOrderSuggestion(null)}>×</button>
+                </div>
+              )}
               {cur.messages.map(m=>(
                 <div key={m.id} className={`wa-msg-row ${m.from}`}>
                   <div className={`wa-bubble ${m.from}`}>
