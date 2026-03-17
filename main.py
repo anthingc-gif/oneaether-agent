@@ -1560,17 +1560,25 @@ async def debug_products_raw_response():
     await auto_refresh_token()
     api_url = credentials["snc"].get("api_url","https://enterprise.sellnchill.com/api")
     token   = credentials["snc"].get("access_token","")
+    # Exact portal payload — search_text="" not [], status=All
     payload = {
-        "company_id": SNC_HARDCODED_COMPANY,
-        "user_id":    SNC_HARDCODED_USER_ID,
-        "username":   SNC_HARDCODED_USERNAME,
-        "timezone":   "Asia/Singapore",
+        "company_id":   "mindmasters",
+        "user_id":      "1qxcb0ssTRGPQaKogvtkMw",
+        "username":     "admin@mindmastersg.com",
+        "timezone":     "Asia/Singapore",
         "request_from": "WEB",
         "data": {"filter_by": {
-            "pagination": {"page_no":1,"no_of_recs":5,"sort_by":"cts","order_by":False},
-            "view": "individual", "status": "Active",
-            "merged": True, "bundles": False,
-            "include_columns": ["name","sku","uom","uom_id","prices","item_id","status"],
+            "date_range": [],
+            "search_on":  ["name","sku","product_code"],
+            "search_text": "",
+            "exact_match": False,
+            "pagination":  {"page_no":1,"no_of_recs":40,"sort_by":"cts","order_by":False},
+            "view":    "individual",
+            "status":  "All",
+            "include_columns": ["sku","short_name","name","product_code","category","sub_category",
+                "brand","uom","base_uom","prices","status","b2b_enabled","quantity","uom_id"],
+            "merged":  True,
+            "bundles": False,
         }}
     }
     async with httpx.AsyncClient(timeout=40) as client:
@@ -2647,15 +2655,7 @@ async def _sync_customers_task():
         page += 1
     logger.info("Customer sync COMPLETE: %d customers stored", total)
 
-@app.get("/sync/products")
-@app.post("/sync/products")
-async def sync_products(background_tasks: BackgroundTasks):
-    background_tasks.add_task(_sync_products_task)
-    return {"status":"syncing","message":"Product sync started in background"}
-
-async def _sync_products_task():
-    count = await sync_products_from_snc(page=1, per_page=100)
-    logger.info("Product sync complete: %d products", count)
+# sync/products moved below
 
 @app.post("/sync/orders")
 async def sync_orders(background_tasks: BackgroundTasks):
