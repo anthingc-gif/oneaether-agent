@@ -1378,6 +1378,51 @@ async def debug_login_response():
         return {"error": str(e)}
 
 
+@app.get("/debug/products-search-test")
+async def debug_products_search_test():
+    """Test products with search_text as Postman does."""
+    result = await snc_call("/products/list", {"data": {"filter_by": {
+        "date_range": [],
+        "relation_id": "121212",
+        "search_on": ["name","sku","product_code"],
+        "confidence": 0.5,
+        "search_text": ["chicken","beef","fish","pork","vegetable"],
+        "exact_match": False,
+        "pagination": {"page_no": 1, "no_of_recs": 10, "sort_by": "cts", "order_by": False},
+        "view": "individual", "status": "All",
+        "include_columns": ["sku","short_name","name","uom","base_uom","prices","status","b2b_enabled","uom_id","quantity","item_id"],
+        "merged": True, "bundles": False,
+    }}})
+    if not result:
+        return {"error": "snc_call returned None"}
+    r    = result.get("result",{})
+    meta = r.get("metadata",{})
+    prods = meta.get("products",[])
+
+    # Also try with empty search_text but different params
+    result2 = await snc_call("/products/list", {"data": {"filter_by": {
+        "date_range": [],
+        "search_on": ["name"],
+        "confidence": 0.0,
+        "search_text": ["a"],
+        "exact_match": False,
+        "pagination": {"page_no": 1, "no_of_recs": 10, "sort_by": "cts", "order_by": False},
+        "view": "individual", "status": "All",
+        "include_columns": ["sku","name","uom","prices","uom_id","item_id"],
+        "merged": True, "bundles": False,
+    }}})
+    meta2 = (result2 or {}).get("result",{}).get("metadata",{})
+    prods2 = meta2.get("products",[])
+
+    return {
+        "search_chicken_count": len(prods),
+        "search_a_count": len(prods2),
+        "meta_keys": list(meta.keys()),
+        "first": {k: prods[0].get(k) for k in ["item_id","name","sku","uom","prices"]} if prods else None,
+        "first2": {k: prods2[0].get(k) for k in ["item_id","name","sku","uom","prices"]} if prods2 else None,
+    }
+
+
 @app.get("/debug/products-raw-test")
 async def debug_products_raw_test():
     """Test products API with exact Postman payload — show raw response."""
