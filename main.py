@@ -1747,14 +1747,35 @@ async def debug_reset_db():
             raw           TEXT,
             synced_at     TEXT
         )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS products (
+            item_id      TEXT PRIMARY KEY,
+            sku          TEXT,
+            name         TEXT,
+            short_name   TEXT,
+            uom          TEXT,
+            uom_id       TEXT,
+            base_uom     TEXT,
+            base_uom_id  TEXT,
+            price        REAL DEFAULT 0,
+            tax_code     TEXT DEFAULT 'SR9',
+            tax_code_id  TEXT,
+            tax_rate     REAL DEFAULT 9,
+            product_code TEXT,
+            category     TEXT,
+            quantity     REAL DEFAULT 0,
+            status       TEXT DEFAULT 'Active',
+            raw          TEXT,
+            synced_at    TEXT
+        )""")
         db.commit()
         db.close()
 
         # Verify columns
         db2 = get_db()
-        cols = [r[1] for r in db2.execute("PRAGMA table_info(customers)").fetchall()]
+        cust_cols = [r[1] for r in db2.execute("PRAGMA table_info(customers)").fetchall()]
+        prod_cols = [r[1] for r in db2.execute("PRAGMA table_info(products)").fetchall()]
         db2.close()
-        return {"success": True, "columns": cols}
+        return {"success": True, "customer_columns": cust_cols, "product_columns": prod_cols}
     except Exception as e:
         import traceback
         return {"error": str(e), "traceback": traceback.format_exc()}
