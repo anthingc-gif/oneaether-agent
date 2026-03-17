@@ -879,23 +879,20 @@ function CustomersScreen({ conn = {} }) {
     if (!agentUrl || syncing) return;
     setSyncing(true);
     try {
-      await fetch(`${agentUrl}/sync/customers`, { method: "POST" });
-      let attempts = 0;
-      const poll = setInterval(async () => {
-        attempts++;
-        const res = await fetch(`${agentUrl}/data/customers?per_page=1`);
-        const d = await res.json();
-        if (d.total > 0 || attempts > 20) {
-          clearInterval(poll);
-          setSyncing(false);
-          setLastSync(new Date().toLocaleTimeString());
-          fetchCustomers(1, "");
-        }
-      }, 2000);
-    } catch(e) { setSyncing(false); }
+      const res = await fetch(`${agentUrl}/sync/customers`, { method: "POST" });
+      const d = await res.json();
+      setLastSync(`${new Date().toLocaleTimeString()} (${d.synced || 0} customers)`);
+      setPage(1);
+      await fetchCustomers(1, "");
+    } catch(e) {
+      console.error("Sync error:", e);
+      alert("Sync failed: " + e.message);
+    } finally {
+      setSyncing(false);
+    }
   };
 
-  useState(() => { if(agentUrl) fetchCustomers(1,""); }, [agentUrl]);
+  useEffect(() => { if(agentUrl) fetchCustomers(1,""); }, [agentUrl]);
 
   const openCustomer = (c) => {
     setSelected(c);
