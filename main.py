@@ -657,11 +657,18 @@ async def sync_products_from_snc(page: int = 1, per_page: int = 100) -> int:
     """Pull all products from SNC and store in DB."""
     # Postman: relation_id is a customer's customer_id, used to filter by customer
     # Without relation_id, pass empty string to get all products
-    # Get relation_id from first customer in DB (required by SNC products API)
+    # relation_id required by SNC — use a real customer (skip test customers)
     relation_id = ""
     try:
         _db = get_db()
-        _r = _db.execute("SELECT customer_id FROM customers ORDER BY synced_at DESC LIMIT 1").fetchone()
+        # Prefer non-test customers with branch_id set
+        _r = _db.execute("""SELECT customer_id FROM customers
+            WHERE customer_id NOT LIKE 'TEST%' AND branch_id != ''
+            ORDER BY synced_at DESC LIMIT 1""").fetchone()
+        if not _r:
+            _r = _db.execute("SELECT customer_id FROM customers WHERE customer_id NOT LIKE 'TEST%' LIMIT 1").fetchone()
+        if not _r:
+            _r = _db.execute("SELECT customer_id FROM customers LIMIT 1").fetchone()
         _db.close()
         if _r: relation_id = _r["customer_id"]
     except: pass
