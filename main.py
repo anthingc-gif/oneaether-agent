@@ -1821,10 +1821,21 @@ async def debug_sync_test():
         return {"error": str(e)}
 
 
+@app.get("/sync/customers")
 @app.post("/sync/customers")
-async def sync_customers(background_tasks: BackgroundTasks):
-    background_tasks.add_task(_sync_customers_task)
-    return {"status":"syncing","message":"Customer sync started in background"}
+async def sync_customers():
+    """Sync customers from SNC synchronously and return count."""
+    try:
+        page=1; total=0
+        while True:
+            count = await sync_customers_from_snc(page=page, per_page=100)
+            total += count
+            if count < 100: break
+            page += 1
+        return {"status":"ok","synced":total}
+    except Exception as e:
+        import traceback
+        return {"status":"error","error":str(e),"traceback":traceback.format_exc()}
 
 async def _sync_customers_task():
     page=1; total=0
