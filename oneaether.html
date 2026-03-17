@@ -1134,32 +1134,117 @@ function CustomersScreen({ conn = {} }) {
 
 
 
-function ProductsScreen() {
+function ProductsScreen({ conn = {} }) {
+  const [products, setProducts]   = useState([]);
+  const [total, setTotal]         = useState(0);
+  const [page, setPage]           = useState(1);
+  const [search, setSearch]       = useState("");
+  const [syncing, setSyncing]     = useState(false);
+  const [lastSync, setLastSync]   = useState("");
+  const PER_PAGE = 40;
+  const agentUrl = conn.agentUrl || window.AGENT_URL || "https://oneaether-agent-production.up.railway.app";
+
+  const fetchProducts = async (p, q) => {
+    try {
+      const res = await fetch(`${agentUrl}/data/products?page=${p||page}&per_page=${PER_PAGE}&search=${encodeURIComponent(q!==undefined?q:search)}`);
+      const d = await res.json();
+      setProducts(d.products || []);
+      setTotal(d.total || 0);
+    } catch(e) { console.warn("fetch products:", e); }
+  };
+
+  const syncProducts = async () => {
+    if (syncing) return;
+    setSyncing(true);
+    try {
+      const res = await fetch(`${agentUrl}/debug/sync-products-now`);
+      const d = await res.json();
+      setLastSync(`${new Date().toLocaleTimeString()} (${d.synced || 0} products)`);
+      await fetchProducts(1, "");
+    } catch(e) {
+      alert("Sync failed: " + e.message);
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  useEffect(() => { fetchProducts(1, ""); }, []);
+
+  const totalPages = Math.max(1, Math.ceil(total / PER_PAGE));
+
   return (
-    <div className="content">
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16}}>
-        <div style={{fontFamily:"var(--fh)",fontWeight:700,fontSize:15}}>Product Performance</div>
-        <button className="btn btn-primary">＋ Add Product</button>
+    <div>
+      <div style={{display:"flex",gap:8,marginBottom:16,alignItems:"center"}}>
+        <input className="form-input" placeholder="Search products..." value={search}
+          style={{flex:1}} onChange={e=>setSearch(e.target.value)}
+          onKeyDown={e=>{ if(e.key==="Enter"){setPage(1);fetchProducts(1,search);} }} />
+        <button className="btn btn-ghost btn-sm" onClick={()=>{setPage(1);fetchProducts(1,search);}}>🔍 Search</button>
+        <button className="btn btn-primary btn-sm" onClick={syncProducts} disabled={syncing}>
+          {syncing ? "⏳ Syncing..." : "↻ Sync Products"}
+        </button>
+        {lastSync && <span style={{fontSize:11,color:"var(--text2)"}}>Last sync: {lastSync}</span>}
       </div>
-      <div className="card" style={{padding:0}}>
-        <table><thead><tr><th>Product</th><th>SKU</th><th>Units Sold</th><th>Revenue</th><th>Growth</th></tr></thead>
-        <tbody>{[...MOCK_PRODUCTS].sort((a,b)=>b.revenue-a.revenue).map(p=>(
-          <tr key={p.id}><td style={{fontWeight:600}}>{p.name}</td><td style={{color:"var(--text2)",fontFamily:"monospace",fontSize:12}}>{p.sku}</td>
-          <td>{p.sold.toLocaleString()}</td><td style={{fontWeight:600}}>RM {p.revenue.toLocaleString()}</td>
-          <td><span className={p.growth>0?"up":"down"}>{p.growth>0?"▲":"▼"} {Math.abs(p.growth)}%</span></td></tr>
-        ))}</tbody></table>
-      </div>
+
+      {products.length === 0 && !syncing && (
+        <div style={{textAlign:"center",padding:40}}>
+          <div style={{fontSize:40,marginBottom:12}}>📦</div>
+          <div style={{fontWeight:600,color:"var(--text)",marginBottom:6}}>No products yet</div>
+          <div style={{fontSize:13,color:"var(--text2)",marginBottom:16}}>Click ↻ Sync Products to pull from SellnChill ERP</div>
+          <button className="btn btn-primary" onClick={syncProducts}>↻ Sync Products</button>
+        </div>
+      )}
+
+      {products.length > 0 && (
+        <>
+          <div style={{fontSize:12,color:"var(--text2)",marginBottom:10}}>
+            Showing {products.length} of {total} products
+          </div>
+          <div style={{background:"var(--card)",borderRadius:"var(--r2)",overflow:"hidden"}}>
+            <table style={{width:"100%",borderCollapse:"collapse"}}>
+              <thead>
+                <tr style={{background:"var(--bg)"}}>
+                  {["Product Name","SKU","UOM","Price","Tax","Status"].map(h=>(
+                    <th key={h} style={{padding:"10px 14px",textAlign:"left",fontSize:11,
+                      fontWeight:700,color:"var(--text2)",letterSpacing:0.5,whiteSpace:"nowrap"}}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {products.map((p,i)=>(
+                  <tr key={p.item_id} style={{borderTop:"1px solid var(--border)",
+                    background:i%2===0?"transparent":"var(--bg)"}}>
+                    <td style={{padding:"10px 14px",fontWeight:600,color:"var(--text)",fontSize:13}}>{p.name}</td>
+                    <td style={{padding:"10px 14px",fontSize:12,color:"var(--text2)",fontFamily:"monospace"}}>{p.sku}</td>
+                    <td style={{padding:"10px 14px",fontSize:12,color:"var(--text2)"}}>{p.uom}</td>
+                    <td style={{padding:"10px 14px",fontSize:13,fontWeight:600,color:"var(--text)"}}>
+                      {p.price > 0 ? "$"+parseFloat(p.price).toFixed(2) : "—"}
+                    </td>
+                    <td style={{padding:"10px 14px",fontSize:12,color:"var(--text2)"}}>{p.tax_code} {p.tax_rate ? p.tax_rate+"%" : ""}</td>
+                    <td style={{padding:"10px 14px"}}>
+                      <span style={{padding:"3px 10px",borderRadius:20,fontSize:11,fontWeight:600,
+                        background:(p.status||"").toLowerCase()==="active"?"#10b98122":"#ef444422",
+                        color:(p.status||"").toLowerCase()==="active"?"#10b981":"#ef4444"}}>
+                        {p.status||"Active"}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div style={{display:"flex",justifyContent:"center",gap:8,marginTop:12,alignItems:"center"}}>
+            <button className="btn btn-ghost btn-sm" disabled={page<=1}
+              onClick={()=>{const p=page-1;setPage(p);fetchProducts(p,search);}}>← Prev</button>
+            <span style={{fontSize:12,color:"var(--text2)"}}>Page {page} of {totalPages}</span>
+            <button className="btn btn-ghost btn-sm" disabled={page>=totalPages}
+              onClick={()=>{const p=page+1;setPage(p);fetchProducts(p,search);}}>Next →</button>
+          </div>
+        </>
+      )}
     </div>
   );
 }
 
-const AI_RESP = {
-  "best customer":"Based on your data, **Jenny Tan** is your top customer at RM 24,000 revenue. Ahmad Razali is close behind at RM 18,450.",
-  "best product":"**Enterprise Suite** leads with RM 63,000 revenue and 41% growth. Premium Bundle follows at RM 48,000.",
-  "churn":"⚠️ **2 customers** are at critical risk: Priya Krishnan (88%) and Siti Noor (72%). Recommend a WhatsApp re-engagement today.",
-  "segment":"You have 5 active segments. The AI has identified 3 new high-value segments — check the Segments → AI Recommendations tab!",
-  "revenue":"Total revenue is **RM 76,450** across your customer base, up 18.4% vs last period.",
-};
 
 function AIInsightsScreen() {
   const [msgs, setMsgs] = useState([{role:"ai",text:"Hi! Ask me anything about customers, products, or segments. Try: *'Who might churn?'* or *'Show segment insights'*"}]);
@@ -2457,7 +2542,7 @@ function App() {
       case "ai-insights": return <AIInsightsScreen/>;
       case "customers":   return <CustomersScreen conn={conn}/>;
       case "segments":    return <SegmentsScreen customers={customers||[]} setCustomers={setCustomers}/>;
-      case "products":    return <ProductsScreen/>;
+      case "products":    return <ProductsScreen conn={conn}/>;
       case "crm-connect": return <ConnectScreen defaultTab="erp"   conn={conn} setConn={setConn}/>;
       case "whatsapp":    return <WhatsAppScreen conn={conn}/>;
       case "wa-connect":  return <ConnectScreen defaultTab="whapi" conn={conn} setConn={setConn}/>;
