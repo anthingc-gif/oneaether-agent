@@ -1378,6 +1378,96 @@ async def debug_login_response():
         return {"error": str(e)}
 
 
+@app.get("/debug/products-b2b")
+async def debug_products_b2b():
+    """Try different product endpoints and params to find what works."""
+    api_url = credentials["snc"].get("api_url","https://enterprise.sellnchill.com/api")
+    token   = credentials["snc"].get("access_token","")
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    results = {}
+
+    base = {
+        "company_id": SNC_HARDCODED_COMPANY,
+        "user_id":    SNC_HARDCODED_USER_ID,
+        "username":   SNC_HARDCODED_USERNAME,
+        "timezone":   "Asia/Singapore",
+        "request_from": "WEB",
+    }
+
+    async def try_payload(label, payload):
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(f"{api_url}/products/list", json=payload, headers=headers)
+                data = resp.json()
+                job_id = data.get("job_id")
+                if job_id:
+                    poll = await poll_job(job_id)
+                    r    = (poll or {}).get("result",{})
+                    meta = r.get("metadata",{})
+                    prods = meta.get("products",[])
+                    results[label] = {
+                        "count": meta.get("count",0),
+                        "returned": len(prods),
+                        "success": (poll or {}).get("status",{}).get("success"),
+                        "error": (poll or {}).get("status",{}).get("message",""),
+                        "sample": prods[0].get("name") if prods else None,
+                    }
+                else:
+                    results[label] = {"error": "no job_id", "resp": str(data)[:200]}
+        except Exception as e:
+            results[label] = {"error": str(e)}
+
+    # Test 1: status=Active, no search, no relation_id
+    await try_payload("active_no_filter", {**base, "data": {"filter_by": {
+        "search_text": [], "search_on": ["name"], "confidence": 0,
+        "exact_match": False, "merged": True, "bundles": False,
+        "view": "individual", "status": "Active",
+        "include_columns": ["name","sku","uom","uom_id","prices","item_id"],
+        "pagination": {"page_no":1,"no_of_recs":5,"sort_by":"cts","order_by":False},
+    }}})
+
+    # Test 2: status=All
+    await try_payload("all_status", {**base, "data": {"filter_by": {
+        "search_text": [], "search_on": ["name"], "confidence": 0,
+        "exact_match": False, "merged": True, "bundles": False,
+        "view": "individual", "status": "All",
+        "include_columns": ["name","sku","uom","uom_id","prices","item_id"],
+        "pagination": {"page_no":1,"no_of_recs":5,"sort_by":"cts","order_by":False},
+    }}})
+
+    # Test 3: b2b_enabled filter
+    await try_payload("b2b_enabled", {**base, "data": {"filter_by": {
+        "search_text": [], "search_on": ["name"], "confidence": 0,
+        "exact_match": False, "merged": True, "bundles": False,
+        "view": "individual", "status": "All", "b2b_enabled": True,
+        "include_columns": ["name","sku","uom","uom_id","prices","item_id","b2b_enabled"],
+        "pagination": {"page_no":1,"no_of_recs":5,"sort_by":"cts","order_by":False},
+    }}})
+
+    # Test 4: with iSTEAKS branch_id
+    await try_payload("with_branch_id", {**base, "data": {"filter_by": {
+        "search_text": [], "search_on": ["name"], "confidence": 0,
+        "exact_match": False, "merged": True, "bundles": False,
+        "view": "individual", "status": "All",
+        "store_id": "121212", "branch_id": "QUtl0kOMQRaTDgMuGGf16A",
+        "include_columns": ["name","sku","uom","uom_id","prices","item_id"],
+        "pagination": {"page_no":1,"no_of_recs":5,"sort_by":"cts","order_by":False},
+    }}})
+
+    # Test 5: pos endpoint instead
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(f"{api_url}/products/get", json={**base, "data": {"filter_by": {
+                "search_text": [], "pagination": {"page_no":1,"no_of_recs":5,"sort_by":"cts","order_by":False},
+                "status": "Active",
+            }}}, headers=headers)
+            results["products_get_endpoint"] = {"status": resp.status_code, "snippet": resp.text[:200]}
+    except Exception as e:
+        results["products_get_endpoint"] = {"error": str(e)}
+
+    return results
+
+
 @app.get("/debug/products-all")
 async def debug_products_all():
     """Get all products with no search_text filter."""
