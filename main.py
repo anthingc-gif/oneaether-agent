@@ -1378,6 +1378,113 @@ async def debug_login_response():
         return {"error": str(e)}
 
 
+@app.get("/debug/products-exact-curl")
+async def debug_products_exact_curl():
+    """Use exact cURL payload — force fresh token first."""
+    # Force token refresh
+    await auto_refresh_token()
+    token = credentials["snc"].get("access_token","")
+    api_url = credentials["snc"].get("api_url","https://enterprise.sellnchill.com/api")
+
+    payload = {
+        "company_id": "mindmasters",
+        "data": {"filter_by": {
+            "date_range": [],
+            "search_on": ["name","sku","product_code"],
+            "search_text": "",
+            "exact_match": False,
+            "pagination": {"page_no":1,"no_of_recs":40,"sort_by":"cts","order_by":False},
+            "view": "individual", "status": "All",
+            "include_columns": ["sku","short_name","name","parent_sku","product_code",
+                "category","sub_category","brand","uom","base_uom","prices","images",
+                "status","is_sellable","is_edited","b2b_enabled","pos_enabled","is_primary",
+                "merged_id","merged_skus","bom_type","linked_stores","inventory_type",
+                "quantity","uom_id","config","attribute_set",
+                "warehouse_type_code","warehouse_type_description"],
+            "merged": True, "bundles": False,
+        }},
+        "user_id": "1qxcb0ssTRGPQaKogvtkMw",
+        "username": "admin@mindmastersg.com",
+        "timezone": "Asia/Singapore",
+        "request_from": "WEB",
+    }
+    async with httpx.AsyncClient(timeout=40) as client:
+        resp = await client.post(f"{api_url}/products/list", json=payload,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+        data = resp.json()
+        job_id = data.get("job_id")
+        if not job_id:
+            return {"step":"no_job_id","http":resp.status_code,"data":data}
+        poll = await poll_job(job_id, timeout=40)
+        if not poll:
+            return {"step":"poll_timeout"}
+        meta  = poll.get("result",{}).get("metadata",{})
+        prods = meta.get("products",[])
+        # Show token prefix so we can compare with browser
+        return {
+            "token_prefix": token[:40]+"...",
+            "count": meta.get("count",0),
+            "products_returned": len(prods),
+            "poll_success": poll.get("status",{}).get("success"),
+            "sample": [{"name":p.get("name"),"sku":p.get("sku"),"item_id":p.get("item_id")} for p in prods[:5]],
+        }
+
+
+@app.get("/debug/products-letter-search")
+async def debug_products_exact_curl():
+    """Use exact cURL payload from browser — raw response."""
+    api_url = credentials["snc"].get("api_url","https://enterprise.sellnchill.com/api")
+    token   = credentials["snc"].get("access_token","")
+    # Exact payload from browser cURL — word for word
+    payload = {
+        "company_id": "mindmasters",
+        "data": {"filter_by": {
+            "date_range": [],
+            "search_on": ["name","sku","product_code"],
+            "search_text": "",
+            "exact_match": False,
+            "pagination": {"page_no":1,"no_of_recs":40,"sort_by":"cts","order_by":False},
+            "view": "individual",
+            "status": "All",
+            "include_columns": ["sku","short_name","name","parent_sku","product_code",
+                "category","sub_category","brand","uom","base_uom","prices","images",
+                "status","is_sellable","is_edited","b2b_enabled","pos_enabled","is_primary",
+                "merged_id","merged_skus","bom_type","linked_stores","inventory_type",
+                "quantity","uom_id","config","attribute_set",
+                "warehouse_type_code","warehouse_type_description"],
+            "merged": True,
+            "bundles": False,
+        }},
+        "user_id":      "1qxcb0ssTRGPQaKogvtkMw",
+        "username":     "admin@mindmastersg.com",
+        "timezone":     "Asia/Singapore",
+        "request_from": "WEB",
+    }
+    async with httpx.AsyncClient(timeout=40) as client:
+        resp = await client.post(f"{api_url}/products/list", json=payload,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+        data = resp.json()
+        job_id = data.get("job_id")
+        if not job_id:
+            return {"step":"no_job_id","http":resp.status_code,"data":data}
+        poll = await poll_job(job_id, timeout=40)
+        if not poll:
+            return {"step":"poll_timeout","job_id":job_id}
+        meta  = poll.get("result",{}).get("metadata",{})
+        prods = meta.get("products",[])
+        return {
+            "http": resp.status_code,
+            "job_id": job_id,
+            "poll_success": poll.get("status",{}).get("success"),
+            "poll_message": poll.get("status",{}).get("message",""),
+            "count": meta.get("count",0),
+            "products_returned": len(prods),
+            "meta_keys": list(meta.keys()),
+            "full_poll_snippet": str(poll)[:800],
+            "sample": prods[:2] if prods else [],
+        }
+
+
 @app.get("/debug/products-letter-search")
 async def debug_products_letter_search():
     """Search products using single letters to bypass empty search_text restriction."""
