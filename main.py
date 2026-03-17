@@ -335,29 +335,34 @@ def db_upsert_products(products: List[Dict]):
     db.commit()
 
     for p in products:
+        # item_id may be null — use sku as fallback primary key
+        item_id = p.get("item_id") or p.get("sku","")
+        if not item_id: continue
+
         prices = p.get("prices") or []
         price  = float(prices[0].get("price",0)) if prices else 0.0
 
-        # tax info can be nested dict or flat
-        tc_raw     = p.get("tax_code") or {}
-        tax_code   = tc_raw.get("tax_code","SR9") if isinstance(tc_raw,dict) else str(tc_raw)
-        tax_code_id= tc_raw.get("tax_code_id","") if isinstance(tc_raw,dict) else p.get("tax_code_id","")
-        tax_rate   = float(tc_raw.get("tax_rate",9) if isinstance(tc_raw,dict) else p.get("tax_rate",9) or 9)
+        tc_raw      = p.get("tax_code") or {}
+        tax_code    = tc_raw.get("tax_code","SR9")    if isinstance(tc_raw,dict) else str(tc_raw) or "SR9"
+        tax_code_id = tc_raw.get("tax_code_id","")    if isinstance(tc_raw,dict) else p.get("tax_code_id","")
+        tax_rate    = float(tc_raw.get("tax_rate",9)  if isinstance(tc_raw,dict) else p.get("tax_rate",9) or 9)
 
-        # uom_id
         uom_id = p.get("uom_id","")
         if isinstance(uom_id, dict): uom_id = uom_id.get("uom_id","")
 
         base_uom    = p.get("base_uom","") or p.get("uom","")
         base_uom_id = p.get("base_uom_id","") or uom_id
+
         db.execute("""INSERT OR REPLACE INTO products
             (item_id,sku,name,short_name,uom,uom_id,base_uom,base_uom_id,
              price,tax_rate,tax_code,tax_code_id,
              product_code,category,quantity,status,raw,synced_at)
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))""",
             (
-                p.get("item_id",""), p.get("sku",""),
-                p.get("name",""), p.get("short_name",""),
+                item_id,
+                p.get("sku","") or item_id,
+                p.get("name",""),
+                p.get("short_name","") or p.get("name",""),
                 p.get("uom",""), uom_id, base_uom, base_uom_id,
                 price, tax_rate, tax_code, tax_code_id,
                 p.get("product_code",""), p.get("category",""),
@@ -625,6 +630,7 @@ async def whapi_send(to: str, body: str) -> bool:
 # ─── Sync functions ───────────────────────────────────────────────────────────
 async def sync_customers_from_snc(page: int = 1, per_page: int = 100) -> int:
     """Pull all customers from SNC and store in DB."""
+    await auto_refresh_token()
     result = await snc_call("/customers/get", {
         "custom": True,
         "data": {"filter_by": {
@@ -838,11 +844,19 @@ async def lookup_products_for_items(items: List[Dict]) -> List[Dict]:
                          (f"%{item['name']}%", f"%{item['name']}%")).fetchone()
         db.close()
         if row:
-            enriched.append({**item, "item_id": row["item_id"], "sku": row["sku"],
-                "full_name": row["name"], "uom": row["uom"], "uom_id": row["uom_id"],
-                "base_uom": row["uom"], "base_uom_id": row["uom_id"],
-                "price": row["price"], "tax_rate": row["tax_rate"],
-                "tax_code": row["tax_code"], "tax_code_id": row["tax_code_id"], "found": True})
+            # item_id may be null — use sku as fallback
+            iid = row["item_id"] or row["sku"] or ""
+            uid = row["uom_id"] or ""
+            enriched.append({**item,
+                "item_id": iid, "sku": row["sku"] or "",
+                "full_name": row["name"], "uom": row["uom"] or "unit",
+                "uom_id": uid, "base_uom": row["base_uom"] or row["uom"] or "unit",
+                "base_uom_id": row["base_uom_id"] or uid,
+                "price": float(row["price"] or 0),
+                "tax_rate": float(row["tax_rate"] or 9),
+                "tax_code": row["tax_code"] or "SR9",
+                "tax_code_id": row["tax_code_id"] or "r4L4SqU4QSmMqU3EsOYJtg",
+                "found": True})
             continue
         # Fall back to SNC API
         result = await snc_call("/products/list", {"data": {"filter_by": {
@@ -1543,6 +1557,7 @@ async def debug_products_letter_search():
 @app.get("/debug/products-raw-response")
 async def debug_products_raw_response():
     """Show complete raw SNC response for products."""
+    await auto_refresh_token()
     api_url = credentials["snc"].get("api_url","https://enterprise.sellnchill.com/api")
     token   = credentials["snc"].get("access_token","")
     payload = {
