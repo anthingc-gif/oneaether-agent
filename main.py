@@ -1378,6 +1378,57 @@ async def debug_login_response():
         return {"error": str(e)}
 
 
+@app.get("/debug/products-all")
+async def debug_products_all():
+    """Get all products with no search_text filter."""
+    api_url = credentials["snc"].get("api_url","https://enterprise.sellnchill.com/api")
+    token   = credentials["snc"].get("access_token","")
+    # Key insight: search_text must be [] (empty), no relation_id, confidence=0
+    payload = {
+        "company_id": SNC_HARDCODED_COMPANY,
+        "user_id":    SNC_HARDCODED_USER_ID,
+        "username":   SNC_HARDCODED_USERNAME,
+        "timezone":   "Asia/Singapore",
+        "request_from": "WEB",
+        "data": {"filter_by": {
+            "date_range": [],
+            "search_on": ["name","sku"],
+            "confidence": 0,
+            "search_text": [],
+            "exact_match": False,
+            "pagination": {"page_no":1,"no_of_recs":10,"sort_by":"cts","order_by":False},
+            "view": "individual", "status": "Active",
+            "include_columns": ["name","sku","uom","uom_id","prices","item_id","status","b2b_enabled","quantity"],
+            "merged": True, "bundles": False,
+        }}
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(f"{api_url}/products/list", json=payload,
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+            data = resp.json()
+            job_id = data.get("job_id")
+            if not job_id:
+                return {"error": "no job_id", "response": data}
+            poll = await poll_job(job_id)
+            if not poll:
+                return {"error": "poll timed out"}
+            r    = poll.get("result",{})
+            meta = r.get("metadata",{})
+            prods = meta.get("products",[])
+            return {
+                "success": poll.get("status",{}).get("success"),
+                "count": meta.get("count",0),
+                "products_returned": len(prods),
+                "meta_keys": list(meta.keys()),
+                "sample": [{k: p.get(k) for k in ["item_id","name","sku","uom","prices","b2b_enabled"]} for p in prods[:3]],
+                "error_msg": poll.get("status",{}).get("message",""),
+            }
+    except Exception as e:
+        import traceback
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+
 @app.get("/debug/products-direct")
 async def debug_products_direct():
     """Hit products API directly without snc_call wrapper to see raw response."""
