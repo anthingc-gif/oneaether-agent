@@ -1654,6 +1654,7 @@ async def debug_reset_db():
         db = get_db()
         db.execute("DROP TABLE IF EXISTS customers")
         db.execute("DROP TABLE IF EXISTS orders")
+        db.execute("DROP TABLE IF EXISTS products")
         db.commit()
 
         # Recreate with full new schema inline
