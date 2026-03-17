@@ -1378,6 +1378,38 @@ async def debug_login_response():
         return {"error": str(e)}
 
 
+@app.get("/debug/products-raw-response")
+async def debug_products_raw_response():
+    """Show complete raw SNC response for products."""
+    api_url = credentials["snc"].get("api_url","https://enterprise.sellnchill.com/api")
+    token   = credentials["snc"].get("access_token","")
+    payload = {
+        "company_id": SNC_HARDCODED_COMPANY,
+        "user_id":    SNC_HARDCODED_USER_ID,
+        "username":   SNC_HARDCODED_USERNAME,
+        "timezone":   "Asia/Singapore",
+        "request_from": "WEB",
+        "data": {"filter_by": {
+            "pagination": {"page_no":1,"no_of_recs":5,"sort_by":"cts","order_by":False},
+            "view": "individual", "status": "Active",
+            "merged": True, "bundles": False,
+            "include_columns": ["name","sku","uom","uom_id","prices","item_id","status"],
+        }}
+    }
+    async with httpx.AsyncClient(timeout=40) as client:
+        resp = await client.post(f"{api_url}/products/list", json=payload,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+        data = resp.json()
+        job_id = data.get("job_id")
+        if not job_id:
+            return {"step": "no_job_id", "response": data}
+        poll = await poll_job(job_id, timeout=40)
+        if not poll:
+            return {"step": "poll_timeout", "job_id": job_id}
+        # Return complete raw poll result
+        return {"job_id": job_id, "full_poll_response": poll}
+
+
 @app.get("/debug/products-portal-sim")
 async def debug_products_portal_sim():
     """Simulate exactly how the SNC B2B portal loads products."""
