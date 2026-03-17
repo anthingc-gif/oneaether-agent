@@ -1378,6 +1378,50 @@ async def debug_login_response():
         return {"error": str(e)}
 
 
+@app.get("/debug/products-raw-test")
+async def debug_products_raw_test():
+    """Test products API with exact Postman payload — show raw response."""
+    # Try with iSTEAKS customer_id = 121212
+    tests = ["121212", "11001058", ""]
+    results = {}
+    for rid in tests:
+        result = await snc_call("/products/list", {"data": {"filter_by": {
+            "date_range": [],
+            "relation_id": rid,
+            "search_on": ["name","sku","product_code"],
+            "confidence": 0.5,
+            "search_text": [],
+            "exact_match": False,
+            "pagination": {"page_no": 1, "no_of_recs": 5, "sort_by": "cts", "order_by": False},
+            "view": "individual", "status": "All",
+            "include_columns": ["short_description","description","sku","short_name","name",
+                "parent_sku","product_code","category","sub_category","brand","uom","base_uom",
+                "prices","images","status","is_sellable","b2b_enabled","uom_id","quantity"],
+            "merged": True, "bundles": False,
+        }}})
+        if result:
+            r    = result.get("result",{})
+            meta = r.get("metadata",{})
+            prods = meta.get("products",[])
+            results[rid or "EMPTY"] = {
+                "count": meta.get("count",0),
+                "meta_keys": list(meta.keys()),
+                "product_count": len(prods),
+                "first_product": {k: prods[0].get(k) for k in ["item_id","name","sku","uom","prices","b2b_enabled"]} if prods else None,
+            }
+        else:
+            results[rid or "EMPTY"] = {"error": "snc_call returned None"}
+
+    # Also show what customer IDs are in DB
+    db = get_db()
+    rows = db.execute("SELECT customer_id, customer_name, branch_id FROM customers LIMIT 10").fetchall()
+    db.close()
+    return {
+        "product_tests": results,
+        "customers_in_db": [dict(r) for r in rows],
+    }
+
+
 @app.get("/debug/sync-products-now")
 async def debug_sync_products_now():
     """Sync 100 products and show result."""
