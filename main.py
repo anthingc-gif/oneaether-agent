@@ -1382,7 +1382,10 @@ async def debug_login_response():
 async def debug_sync_products_now():
     """Sync 100 products and show result."""
     try:
-        relation_id_used = SNC_RELATION_ID
+        _db2 = get_db()
+        _rr = _db2.execute("SELECT customer_id FROM customers WHERE customer_id NOT LIKE '%-%-%' AND branch_id != '' LIMIT 1").fetchone()
+        _db2.close()
+        relation_id_used = _rr["customer_id"] if _rr else "NONE"
 
         count = await sync_products_from_snc(page=1, per_page=100)
         db = get_db()
