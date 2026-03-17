@@ -852,16 +852,18 @@ function CustomersScreen({ conn = {} }) {
   const [ordersLoading, setOrdersLoading] = useState(false);
   const PER_PAGE = 20;
 
-  const agentUrl = conn.agentUrl || window.AGENT_URL || "";
+  const agentUrl = conn.agentUrl || window.AGENT_URL || "https://oneaether-agent-production.up.railway.app";
 
   const fetchCustomers = async (p, q) => {
-    if (!agentUrl) return;
     try {
       const res = await fetch(`${agentUrl}/data/customers?page=${p||page}&per_page=${PER_PAGE}&search=${encodeURIComponent(q!==undefined?q:search)}`);
       const d = await res.json();
       setCustomers(d.customers || []);
       setTotal(d.total || 0);
-    } catch(e) { console.warn("fetch customers:", e); }
+    } catch(e) {
+      console.warn("fetch customers:", e);
+      alert("Error fetching customers: " + e.message);
+    }
   };
 
   const fetchOrders = async (customerId) => {
@@ -876,14 +878,23 @@ function CustomersScreen({ conn = {} }) {
   };
 
   const syncFromSNC = async () => {
-    if (!agentUrl || syncing) return;
+    if (syncing) return;
     setSyncing(true);
     try {
-      const res = await fetch(`${agentUrl}/sync/customers`, { method: "POST" });
-      const d = await res.json();
-      setLastSync(`${new Date().toLocaleTimeString()} (${d.synced || 0} customers)`);
-      setPage(1);
-      await fetchCustomers(1, "");
+      const url = agentUrl + "/sync/customers";
+      console.log("Syncing from:", url);
+      const res = await fetch(url, { method: "POST" });
+      const text = await res.text();
+      console.log("Sync response:", text);
+      let d = {};
+      try { d = JSON.parse(text); } catch(e) {}
+      if (d.status === "error") {
+        alert("Sync error: " + d.error);
+      } else {
+        setLastSync(`${new Date().toLocaleTimeString()} (${d.synced || 0} customers)`);
+        setPage(1);
+        await fetchCustomers(1, "");
+      }
     } catch(e) {
       console.error("Sync error:", e);
       alert("Sync failed: " + e.message);
@@ -892,7 +903,7 @@ function CustomersScreen({ conn = {} }) {
     }
   };
 
-  useEffect(() => { if(agentUrl) fetchCustomers(1,""); }, [agentUrl]);
+  useEffect(() => { fetchCustomers(1,""); }, []);
 
   const openCustomer = (c) => {
     setSelected(c);
