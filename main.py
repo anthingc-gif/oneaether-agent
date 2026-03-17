@@ -1378,6 +1378,105 @@ async def debug_login_response():
         return {"error": str(e)}
 
 
+@app.get("/debug/products-try-all-customers")
+async def debug_products_try_all_customers():
+    """Try products/list with every customer_id in DB as relation_id."""
+    db = get_db()
+    customers = db.execute("SELECT customer_id, customer_name FROM customers LIMIT 20").fetchall()
+    db.close()
+    api_url = credentials["snc"].get("api_url","https://enterprise.sellnchill.com/api")
+    token   = credentials["snc"].get("access_token","")
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    results = {}
+    for row in customers:
+        cid = row["customer_id"]
+        payload = {
+            "company_id": SNC_HARDCODED_COMPANY,
+            "user_id":    SNC_HARDCODED_USER_ID,
+            "username":   SNC_HARDCODED_USERNAME,
+            "timezone":   "Asia/Singapore",
+            "request_from": "WEB",
+            "data": {"filter_by": {
+                "date_range": [], "relation_id": cid,
+                "search_on": ["name","sku"], "confidence": 0.5,
+                "search_text": [], "exact_match": False,
+                "pagination": {"page_no":1,"no_of_recs":3,"sort_by":"cts","order_by":False},
+                "view": "individual", "status": "All",
+                "include_columns": ["name","sku","uom","uom_id","prices","item_id","b2b_enabled"],
+                "merged": True, "bundles": False,
+            }}
+        }
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.post(f"{api_url}/products/list", json=payload, headers=headers)
+                data = resp.json()
+                job_id = data.get("job_id")
+                if job_id:
+                    poll = await poll_job(job_id)
+                    meta = (poll or {}).get("result",{}).get("metadata",{})
+                    prods = meta.get("products",[])
+                    count = meta.get("count",0)
+                    if count > 0:
+                        results[cid] = {"name": row["customer_name"], "count": count, "sample": prods[0].get("name") if prods else None}
+                    # Only store non-zero results to keep response clean
+        except Exception as e:
+            pass
+    if not results:
+        return {"message": "No customer returned products — products may need B2B enabling in SNC", "customers_tried": [dict(r) for r in customers]}
+    return {"working_relation_ids": results}
+
+
+@app.get("/debug/products-from-orders")
+async def debug_products_from_orders():
+    """Extract unique products from past SNC orders — workaround for products API."""
+    result = await snc_call("/b2b/orders/get", {"data": {"include_orders": True, "filter_by": {
+        "source": "B2B", "platform": "Whatsapp",
+        "store_id": [], "branch_id": [], "status": "All",
+        "date_range": [
+            (datetime.now() - timedelta(days=365)).strftime("%d-%m-%Y"),
+            datetime.now().strftime("%d-%m-%Y"),
+        ],
+        "search_on": ["order_number"], "search_text": "", "exact_match": False,
+        "pagination": {"page_no":1,"no_of_recs":100,"sort_by":"order_cts","order_by":False},
+        "whatsapp_contact_id": [], "review_required": False,
+        "packer_id":"","sales_person_id":"","date_range_by":"order_cts","warehouse_id":"All","tags":[],
+    }}})
+    if not result:
+        return {"error": "No orders found"}
+    r     = result.get("result",{})
+    meta  = r.get("metadata",{})
+    orders = meta.get("OrderList") or meta.get("orders") or []
+    
+    # Extract unique products from order items
+    seen = {}
+    for o in orders:
+        for item in (o.get("item_info") or []):
+            iid = item.get("item_id","")
+            if iid and iid not in seen:
+                seen[iid] = {
+                    "item_id":    iid,
+                    "name":       item.get("name",""),
+                    "sku":        item.get("sku",""),
+                    "uom":        item.get("uom",""),
+                    "uom_id":     item.get("uom_id",""),
+                    "base_uom":   item.get("base_uom",""),
+                    "base_uom_id":item.get("base_uom_id",""),
+                    "price":      item.get("price",0),
+                    "tax_code":   item.get("tax_code","SR9"),
+                    "tax_code_id":item.get("tax_code_id",""),
+                    "tax_rate":   item.get("tax_rate",9),
+                    "status":     "Active",
+                }
+    products = list(seen.values())
+    if products:
+        db_upsert_products(products)
+    return {
+        "orders_scanned": len(orders),
+        "unique_products_found": len(products),
+        "products": products[:10],
+    }
+
+
 @app.get("/debug/products-b2b")
 async def debug_products_b2b():
     """Try different product endpoints and params to find what works."""
