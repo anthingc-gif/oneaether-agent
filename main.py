@@ -1378,6 +1378,57 @@ async def debug_login_response():
         return {"error": str(e)}
 
 
+@app.get("/debug/products-direct")
+async def debug_products_direct():
+    """Hit products API directly without snc_call wrapper to see raw response."""
+    api_url = credentials["snc"].get("api_url","https://enterprise.sellnchill.com/api")
+    token   = credentials["snc"].get("access_token","")
+    payload = {
+        "company_id": SNC_HARDCODED_COMPANY,
+        "user_id":    SNC_HARDCODED_USER_ID,
+        "username":   SNC_HARDCODED_USERNAME,
+        "timezone":   "Asia/Singapore",
+        "request_from": "WEB",
+        "data": {"filter_by": {
+            "date_range": [],
+            "relation_id": "121212",
+            "search_on": ["name","sku"],
+            "confidence": 0.5,
+            "search_text": ["chicken"],
+            "exact_match": False,
+            "pagination": {"page_no":1,"no_of_recs":5,"sort_by":"cts","order_by":False},
+            "view": "individual", "status": "All",
+            "include_columns": ["name","sku","uom","uom_id","prices","item_id","status"],
+            "merged": True, "bundles": False,
+        }}
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{api_url}/products/list",
+                json=payload,
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            )
+            raw = resp.text
+            data = resp.json()
+            job_id = data.get("job_id")
+            poll_result = None
+            if job_id:
+                poll_result = await poll_job(job_id)
+            return {
+                "http_status": resp.status_code,
+                "has_job_id": bool(job_id),
+                "job_id": job_id,
+                "direct_keys": list(data.keys()),
+                "direct_snippet": raw[:300],
+                "poll_result_keys": list(poll_result.keys()) if poll_result else None,
+                "poll_snippet": str(poll_result)[:500] if poll_result else None,
+            }
+    except Exception as e:
+        import traceback
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+
 @app.get("/debug/products-search-test")
 async def debug_products_search_test():
     """Test products with search_text as Postman does."""
