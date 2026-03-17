@@ -1378,6 +1378,61 @@ async def debug_login_response():
         return {"error": str(e)}
 
 
+@app.get("/debug/products-letter-search")
+async def debug_products_letter_search():
+    """Search products using single letters to bypass empty search_text restriction."""
+    api_url = credentials["snc"].get("api_url","https://enterprise.sellnchill.com/api")
+    token   = credentials["snc"].get("access_token","")
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    all_products = {}
+
+    for letter in ["a","e","i","o","the","chicken","beef","pork","fish","rice","cheese","butter","cake","frozen","fresh"]:
+        try:
+            payload = {
+                "company_id": SNC_HARDCODED_COMPANY,
+                "user_id":    SNC_HARDCODED_USER_ID,
+                "username":   SNC_HARDCODED_USERNAME,
+                "timezone":   "Asia/Singapore",
+                "request_from": "WEB",
+                "data": {"filter_by": {
+                    "date_range": [],
+                    "relation_id": "121212",
+                    "search_on": ["name","sku","product_code"],
+                    "confidence": 0.1,
+                    "search_text": [letter],
+                    "exact_match": False,
+                    "pagination": {"page_no":1,"no_of_recs":50,"sort_by":"cts","order_by":False},
+                    "view": "individual", "status": "Active",
+                    "include_columns": ["name","sku","uom","uom_id","prices","item_id","status","b2b_enabled"],
+                    "merged": True, "bundles": False,
+                }}
+            }
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(f"{api_url}/products/list", json=payload, headers=headers)
+                data = resp.json()
+                job_id = data.get("job_id")
+                if not job_id: continue
+                poll = await poll_job(job_id, timeout=30)
+                if not poll: continue
+                status = poll.get("status",{})
+                if not status.get("success",True): continue
+                prods = poll.get("result",{}).get("metadata",{}).get("products",[])
+                for p in prods:
+                    iid = p.get("item_id","")
+                    if iid and iid not in all_products:
+                        all_products[iid] = p
+        except Exception as e:
+            logger.warning("letter search %s failed: %s", letter, e)
+            continue
+
+    products = list(all_products.values())
+    if products:
+        db_upsert_products(products)
+        return {"found": len(products), "saved": True,
+                "sample": [{"name":p.get("name"),"sku":p.get("sku"),"item_id":p.get("item_id")} for p in products[:10]]}
+    return {"found": 0, "message": "No products found with any search term — check SNC product setup"}
+
+
 @app.get("/debug/products-raw-response")
 async def debug_products_raw_response():
     """Show complete raw SNC response for products."""
