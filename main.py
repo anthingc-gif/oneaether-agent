@@ -36,104 +36,121 @@ def get_db():
 
 def init_db():
     db = get_db()
-    # Migrate: drop old tables if schema changed (detected by missing columns)
+    # Drop tables if columns are missing (schema migration)
     try:
         cols = [r[1] for r in db.execute("PRAGMA table_info(customers)").fetchall()]
-        if "price_tier" not in cols or "outstanding_amount" not in cols:
-            logger.info("Migrating customers table to new schema...")
-            db.execute("DROP TABLE IF EXISTS customers")
-            db.commit()
-    except Exception as e:
-        logger.warning("Migration check failed: %s", e)
-    try:
-        cols = [r[1] for r in db.execute("PRAGMA table_info(orders)").fetchall()]
-        if "item_info" not in cols or "paid_status" not in cols:
-            logger.info("Migrating orders table to new schema...")
-            db.execute("DROP TABLE IF EXISTS orders")
-            db.commit()
-    except Exception as e:
-        logger.warning("Orders migration check failed: %s", e)
+        if "customer_code" not in cols or "price_tier" not in cols:
+            db.execute("DROP TABLE IF EXISTS customers"); db.commit()
+    except: pass
     try:
         cols = [r[1] for r in db.execute("PRAGMA table_info(products)").fetchall()]
-        if "base_uom" not in cols:
-            logger.info("Migrating products table to new schema...")
-            db.execute("DROP TABLE IF EXISTS products")
-            db.commit()
-    except Exception as e:
-        logger.warning("Products migration check failed: %s", e)
+        if "base_uom" not in cols or "short_name" not in cols:
+            db.execute("DROP TABLE IF EXISTS products"); db.commit()
+    except: pass
+    try:
+        cols = [r[1] for r in db.execute("PRAGMA table_info(orders)").fetchall()]
+        if "paid_status" not in cols or "item_info" not in cols:
+            db.execute("DROP TABLE IF EXISTS orders"); db.commit()
+    except: pass
+
     db.executescript("""
         CREATE TABLE IF NOT EXISTS credentials (
-            key   TEXT PRIMARY KEY,
-            value TEXT NOT NULL,
-            uts   TEXT DEFAULT (datetime('now'))
+            key TEXT PRIMARY KEY, value TEXT NOT NULL,
+            uts TEXT DEFAULT (datetime('now'))
         );
 
         CREATE TABLE IF NOT EXISTS customers (
-            customer_id   TEXT PRIMARY KEY,
-            store_id      TEXT,
-            customer_name TEXT,
-            phone         TEXT,
-            email         TEXT,
-            store         TEXT,
-            branch_id     TEXT,
-            branch_name   TEXT,
-            address       TEXT,
-            credit_term   TEXT,
-            status        TEXT DEFAULT 'Active',
-            raw           TEXT,
-            synced_at     TEXT DEFAULT (datetime('now'))
+            customer_id        TEXT PRIMARY KEY,
+            customer_code      TEXT,
+            customer_name      TEXT,
+            customer_type      TEXT,
+            phone              TEXT,
+            email              TEXT,
+            uen                TEXT,
+            store_id           TEXT,
+            store              TEXT,
+            branch_id          TEXT,
+            branch_name        TEXT,
+            address            TEXT,
+            credit_term        TEXT,
+            credit_term_id     TEXT,
+            price_tier         TEXT,
+            outstanding_amount REAL DEFAULT 0,
+            max_credit_limit   REAL DEFAULT 0,
+            min_order_amount   REAL DEFAULT 0,
+            tax_code           TEXT,
+            currency           TEXT DEFAULT 'SGD',
+            status             TEXT DEFAULT 'Active',
+            billing_id         TEXT,
+            payment_mode       TEXT,
+            sales_person       TEXT,
+            b2b_stores         TEXT,
+            raw                TEXT,
+            synced_at          TEXT DEFAULT (datetime('now'))
         );
 
         CREATE TABLE IF NOT EXISTS products (
-            item_id     TEXT PRIMARY KEY,
-            sku         TEXT,
-            name        TEXT,
-            uom         TEXT,
-            uom_id      TEXT,
-            price       REAL DEFAULT 0,
-            tax_rate    REAL DEFAULT 9,
-            tax_code    TEXT DEFAULT 'SR9',
-            tax_code_id TEXT,
-            status      TEXT DEFAULT 'Active',
-            raw         TEXT,
-            synced_at   TEXT DEFAULT (datetime('now'))
+            item_id      TEXT PRIMARY KEY,
+            sku          TEXT,
+            name         TEXT,
+            short_name   TEXT,
+            uom          TEXT,
+            uom_id       TEXT,
+            base_uom     TEXT,
+            base_uom_id  TEXT,
+            price        REAL DEFAULT 0,
+            tax_code     TEXT DEFAULT 'SR9',
+            tax_code_id  TEXT,
+            tax_rate     REAL DEFAULT 9,
+            product_code TEXT,
+            category     TEXT,
+            quantity     REAL DEFAULT 0,
+            status       TEXT DEFAULT 'Active',
+            raw          TEXT,
+            synced_at    TEXT DEFAULT (datetime('now'))
         );
 
         CREATE TABLE IF NOT EXISTS orders (
             order_id      TEXT PRIMARY KEY,
-            order_number  TEXT UNIQUE,
+            order_number  TEXT,
             customer_id   TEXT,
             store_id      TEXT,
+            store         TEXT,
+            branch_id     TEXT,
+            branch_name   TEXT,
             status        TEXT,
-            total_amount  REAL DEFAULT 0,
+            paid_status   TEXT,
             delivery_date TEXT,
+            delivery_type TEXT,
+            item_total    REAL DEFAULT 0,
+            tax_amount    REAL DEFAULT 0,
+            total_amount  REAL DEFAULT 0,
+            items_count   INTEGER DEFAULT 0,
+            item_info     TEXT,
             chat_id       TEXT,
+            platform      TEXT,
+            source        TEXT,
+            created_by    TEXT,
             raw           TEXT,
             synced_at     TEXT DEFAULT (datetime('now'))
         );
 
         CREATE TABLE IF NOT EXISTS chat_assignments (
             chat_id     TEXT PRIMARY KEY,
-            customer_id TEXT,
-            customer    TEXT,
-            store_id    TEXT,
-            branch_id   TEXT,
-            branch      TEXT,
+            customer_id TEXT, customer TEXT,
+            store_id    TEXT, branch_id TEXT, branch TEXT,
             updated_at  TEXT DEFAULT (datetime('now'))
         );
 
         CREATE TABLE IF NOT EXISTS conversation_log (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id    TEXT,
-            role       TEXT,
-            message    TEXT,
-            intent     TEXT,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT, role TEXT, message TEXT, intent TEXT,
             created_at TEXT DEFAULT (datetime('now'))
         );
     """)
-    db.commit()
-    db.close()
+    db.commit(); db.close()
     logger.info("Database initialised at %s", DB_PATH)
+
 
 def db_set_credential(key: str, value: str):
     db = get_db()
@@ -331,15 +348,17 @@ def db_upsert_products(products: List[Dict]):
         uom_id = p.get("uom_id","")
         if isinstance(uom_id, dict): uom_id = uom_id.get("uom_id","")
 
+        base_uom    = p.get("base_uom","") or p.get("uom","")
+        base_uom_id = p.get("base_uom_id","") or uom_id
         db.execute("""INSERT OR REPLACE INTO products
-            (item_id,sku,name,short_name,uom,base_uom,uom_id,
+            (item_id,sku,name,short_name,uom,uom_id,base_uom,base_uom_id,
              price,tax_rate,tax_code,tax_code_id,
              product_code,category,quantity,status,raw,synced_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))""",
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))""",
             (
                 p.get("item_id",""), p.get("sku",""),
                 p.get("name",""), p.get("short_name",""),
-                p.get("uom",""), p.get("base_uom",""), uom_id,
+                p.get("uom",""), uom_id, base_uom, base_uom_id,
                 price, tax_rate, tax_code, tax_code_id,
                 p.get("product_code",""), p.get("category",""),
                 float(p.get("quantity",0) or 0),
@@ -638,9 +657,19 @@ async def sync_products_from_snc(page: int = 1, per_page: int = 100) -> int:
     """Pull all products from SNC and store in DB."""
     # Postman: relation_id is a customer's customer_id, used to filter by customer
     # Without relation_id, pass empty string to get all products
+    # Get relation_id from first customer in DB (required by SNC products API)
+    relation_id = ""
+    try:
+        _db = get_db()
+        _r = _db.execute("SELECT customer_id FROM customers ORDER BY synced_at DESC LIMIT 1").fetchone()
+        _db.close()
+        if _r: relation_id = _r["customer_id"]
+    except: pass
+    logger.info("sync_products: using relation_id=%s", relation_id)
+
     result = await snc_call("/products/list", {"data": {"filter_by": {
         "date_range": [],
-        "relation_id": "",
+        "relation_id": relation_id,
         "search_on": ["name","sku","product_code"],
         "confidence": 0.5,
         "search_text": [],
