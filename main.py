@@ -657,16 +657,21 @@ async def sync_products_from_snc(page: int = 1, per_page: int = 100) -> int:
     """Pull all products from SNC and store in DB."""
     # Postman: relation_id is a customer's customer_id, used to filter by customer
     # Without relation_id, pass empty string to get all products
-    # relation_id required by SNC — use a real customer (skip test customers)
+    # relation_id must be a numeric customer code (e.g. "121212"), not an order number
+    # SNC customer_id field is the display code like "121212" or "TEST_CUST004"
     relation_id = ""
     try:
         _db = get_db()
-        # Prefer non-test customers with branch_id set
+        # Pick customer whose ID looks like a numeric/short code (not order numbers like MIN-032026-*)
         _r = _db.execute("""SELECT customer_id FROM customers
-            WHERE customer_id NOT LIKE 'TEST%' AND branch_id != ''
-            ORDER BY synced_at DESC LIMIT 1""").fetchone()
+            WHERE customer_id NOT LIKE '%-%-%'
+            AND customer_id NOT LIKE 'TEST%'
+            AND branch_id != ''
+            LIMIT 1""").fetchone()
         if not _r:
-            _r = _db.execute("SELECT customer_id FROM customers WHERE customer_id NOT LIKE 'TEST%' LIMIT 1").fetchone()
+            _r = _db.execute("""SELECT customer_id FROM customers
+                WHERE customer_id NOT LIKE '%-%-%'
+                LIMIT 1""").fetchone()
         if not _r:
             _r = _db.execute("SELECT customer_id FROM customers LIMIT 1").fetchone()
         _db.close()
