@@ -335,12 +335,23 @@ def db_upsert_products(products: List[Dict]):
     db.commit()
 
     for p in products:
-        # item_id may be null — use sku as fallback primary key
         item_id = p.get("item_id") or p.get("sku","")
         if not item_id: continue
 
+        # Pick best price: prefer "Default Price" tier, then "B2B", then first non-zero
         prices = p.get("prices") or []
-        price  = float(prices[0].get("price",0)) if prices else 0.0
+        price  = 0.0
+        for tier_name in ["Default Price","B2B","POS"]:
+            t = next((x for x in prices if x.get("name") == tier_name), None)
+            if t and float(t.get("price",0) or 0) > 0:
+                price = float(t["price"])
+                break
+        if price == 0.0:
+            for t in prices:
+                v = float(t.get("price",0) or 0)
+                if v > 0:
+                    price = v
+                    break
 
         tc_raw      = p.get("tax_code") or {}
         tax_code    = tc_raw.get("tax_code","SR9")    if isinstance(tc_raw,dict) else str(tc_raw) or "SR9"
@@ -1591,8 +1602,20 @@ async def debug_products_raw_response():
         poll = await poll_job(job_id, timeout=40)
         if not poll:
             return {"step": "poll_timeout", "job_id": job_id}
-        # Return complete raw poll result
-        return {"job_id": job_id, "full_poll_response": poll}
+        meta  = poll.get("result",{}).get("metadata",{})
+        prods = meta.get("products",[])
+        saved = 0
+        if prods:
+            db_upsert_products(prods)
+            saved = len(prods)
+        return {
+            "job_id": job_id,
+            "count_in_snc": meta.get("count",0),
+            "products_returned": len(prods),
+            "saved_to_db": saved,
+            "poll_success": poll.get("status",{}).get("success"),
+            "sample": [{"name":p.get("name"),"sku":p.get("sku"),"uom":p.get("uom"),"prices":p.get("prices",[])} for p in prods[:5]],
+        }
 
 
 @app.get("/debug/products-portal-sim")
@@ -2094,14 +2117,19 @@ async def debug_sync_products_now():
         _db2.close()
         relation_id_used = _rr["customer_id"] if _rr else "NONE"
 
-        count = await sync_products_from_snc(page=1, per_page=200)
+        page=1; total=0
+        while True:
+            count = await sync_products_from_snc(page=page, per_page=40)
+            total += count
+            if count < 40: break
+            page += 1
         db = get_db()
-        total = db.execute("SELECT COUNT(*) FROM products").fetchone()[0]
-        sample = db.execute("SELECT item_id,sku,name,uom,price,tax_code,status FROM products LIMIT 5").fetchall()
+        db_total = db.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+        sample = db.execute("SELECT item_id,sku,name,uom,price,status FROM products WHERE price > 0 LIMIT 5").fetchall()
         db.close()
         return {
-            "synced": count,
-            "total_in_db": total,
+            "synced": total,
+            "total_in_db": db_total,
             "sample": [dict(r) for r in sample],
         }
     except Exception as e:
@@ -2655,7 +2683,27 @@ async def _sync_customers_task():
         page += 1
     logger.info("Customer sync COMPLETE: %d customers stored", total)
 
-# sync/products moved below
+# ─── Product sync endpoint ───────────────────────────────────────────────────
+@app.get("/sync/products")
+@app.post("/sync/products")
+async def sync_products_endpoint():
+    """Sync ALL products from SNC - paginate through all pages."""
+    try:
+        await auto_refresh_token()
+        page = 1; total = 0
+        while True:
+            count = await sync_products_from_snc(page=page, per_page=40)
+            total += count
+            if count < 40: break
+            page += 1
+        db = get_db()
+        db_total = db.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+        db.close()
+        return {"status": "ok", "synced": total, "total_in_db": db_total}
+    except Exception as e:
+        import traceback as tb
+        return {"status": "error", "error": str(e), "traceback": tb.format_exc()}
+
 
 @app.post("/sync/orders")
 async def sync_orders(background_tasks: BackgroundTasks):
