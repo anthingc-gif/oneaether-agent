@@ -1565,6 +1565,90 @@ async def debug_products_letter_search():
     return {"found": 0, "message": "No products found with any search term — check SNC product setup"}
 
 
+@app.get("/debug/save-all-products-v2")
+async def debug_save_all_products_v2():
+    """Fetch and save ALL 513 products - paginate all pages."""
+    await auto_refresh_token()
+    api_url = credentials["snc"].get("api_url","https://enterprise.sellnchill.com/api")
+    token   = credentials["snc"].get("access_token","")
+    total_saved = 0
+    page = 1
+    while True:
+        payload = {
+            "company_id": SNC_HARDCODED_COMPANY,
+            "user_id": SNC_HARDCODED_USER_ID,
+            "username": SNC_HARDCODED_USERNAME,
+            "timezone": "Asia/Singapore",
+            "request_from": "WEB",
+            "data": {"filter_by": {
+                "date_range": [],
+                "search_on": ["name","sku","product_code"],
+                "search_text": "",
+                "exact_match": False,
+                "pagination": {"page_no": page, "no_of_recs": 40, "sort_by": "cts", "order_by": False},
+                "view": "individual", "status": "All",
+                "include_columns": ["sku","short_name","name","product_code","category",
+                    "uom","base_uom","prices","status","b2b_enabled","uom_id","quantity"],
+                "merged": True, "bundles": False,
+            }}
+        }
+        async with httpx.AsyncClient(timeout=40) as client:
+            resp = await client.post(f"{api_url}/products/list", json=payload,
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+            data = resp.json()
+            job_id = data.get("job_id")
+            if not job_id:
+                break
+            poll = await poll_job(job_id, timeout=40)
+            if not poll:
+                break
+            meta  = poll.get("result",{}).get("metadata",{})
+            prods = meta.get("products",[])
+            if not prods:
+                break
+            # Save with correct price extraction
+            db = get_db()
+            saved = 0
+            for p in prods:
+                item_id = p.get("item_id") or p.get("sku","")
+                if not item_id: continue
+                prices = p.get("prices") or []
+                price = 0.0
+                for tier_name in ["Default Price","B2B","POS"]:
+                    t = next((x for x in prices if x.get("name") == tier_name), None)
+                    if t and float(t.get("price",0) or 0) > 0:
+                        price = float(t["price"]); break
+                if price == 0.0:
+                    for t in prices:
+                        v = float(t.get("price",0) or 0)
+                        if v > 0: price = v; break
+                uom_id = p.get("uom_id","") or ""
+                if isinstance(uom_id, dict): uom_id = uom_id.get("uom_id","")
+                try:
+                    db.execute("""INSERT OR REPLACE INTO products
+                        (item_id,sku,name,short_name,uom,uom_id,base_uom,base_uom_id,
+                         price,tax_rate,tax_code,product_code,category,status,raw,synced_at)
+                        VALUES(?,?,?,?,?,?,?,?,?,9,'SR9',?,?,?,?,datetime('now'))""",
+                        (item_id, p.get("sku",""), p.get("name",""), p.get("short_name","") or p.get("name",""),
+                         p.get("uom",""), uom_id, p.get("base_uom","") or p.get("uom",""), uom_id,
+                         price, p.get("product_code",""), p.get("category",""),
+                         p.get("status","Active"), json.dumps(p)))
+                    saved += 1
+                except Exception as e:
+                    logger.warning("product insert error: %s", e)
+            db.commit(); db.close()
+            total_saved += saved
+            if len(prods) < 40:
+                break
+            page += 1
+    db2 = get_db()
+    db_total = db2.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+    sample = db2.execute("SELECT item_id,sku,name,uom,price FROM products WHERE price > 0 LIMIT 5").fetchall()
+    db2.close()
+    return {"pages_fetched": page, "total_saved": total_saved, "total_in_db": db_total,
+            "sample": [dict(r) for r in sample]}
+
+
 @app.get("/debug/products-raw-response")
 async def debug_products_raw_response():
     """Show complete raw SNC response for products."""
