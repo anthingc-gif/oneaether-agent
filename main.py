@@ -820,7 +820,7 @@ def extract_order_number(text: str) -> Optional[str]:
 # ─── AI Analysis ──────────────────────────────────────────────────────────────
 async def analyze_with_ai(text: str, sender: str, customer: Optional[str], history: List[Dict]) -> Dict:
     anthropic_key = credentials["agent"].get("anthropic_key","") or os.getenv("ANTHROPIC_API_KEY","")
-    openai_key    = credentials["agent"].get("openai_key","") or os.getenv("OPENAI_API_KEY","") or os.getenv("OPENAI_API_KEY","")
+    openai_key    = credentials["agent"].get("openai_key","") or os.getenv("OPENAI_API_KEY","") or os.getenv("OPENAI_API_KEY","") or os.getenv("OPENAI_API_KEY","") or os.getenv("OPENAI_API_KEY","") or os.getenv("OPENAI_API_KEY","")
     intent, confidence = detect_intent(text)
     base = {"intent": intent, "confidence": confidence, "items": extract_items(text),
             "order_number": extract_order_number(text), "reply": None, "method": "rule-based"}
@@ -2632,8 +2632,14 @@ async def save_credentials(payload: CredentialsPayload):
         if payload.whapi.get("base_url"):   db_set_credential("whapi_base_url",   payload.whapi["base_url"])
         if payload.whapi.get("channel_id"): db_set_credential("whapi_channel_id", payload.whapi["channel_id"])
     if payload.agent:
-        if payload.agent.get("anthropic_key"): db_set_credential("anthropic_key", payload.agent["anthropic_key"])
-        if payload.agent.get("openai_key"):    db_set_credential("openai_key",    payload.agent["openai_key"])
+        if payload.agent.get("anthropic_key"):
+            credentials["agent"]["anthropic_key"] = payload.agent["anthropic_key"]
+            db_set_credential("anthropic_key", payload.agent["anthropic_key"])
+        if payload.agent.get("openai_key"):
+            credentials["agent"]["openai_key"] = payload.agent["openai_key"]
+            db_set_credential("openai_key", payload.agent["openai_key"])
+        if "enabled" in payload.agent:
+            credentials["agent"]["enabled"] = payload.agent["enabled"] in (True, "true", "1")
     return {"status":"ok"}
 
 @app.get("/credentials/status")
@@ -3331,6 +3337,32 @@ async def create_order_manual(request: Request):
     return {"order_number": order_num, "items": len(found), "missing": [i["name"] for i in missing], "status": "created"}
 
 
+@app.get("/debug/agent-status")
+async def debug_agent_status():
+    """Show what AI keys are loaded and test agent."""
+    ak = credentials["agent"].get("anthropic_key","")
+    ok = credentials["agent"].get("openai_key","")
+    env_ak = os.getenv("ANTHROPIC_API_KEY","")
+    env_ok = os.getenv("OPENAI_API_KEY","")
+    # Test with a sample message
+    test_result = None
+    try:
+        test_result = await analyze_with_ai(
+            "I want 5kg chicken and 3kg beef", "Test", "iSTEAKS", [])
+    except Exception as e:
+        test_result = {"error": str(e)}
+    return {
+        "anthropic_key_set": bool(ak),
+        "anthropic_key_prefix": ak[:15]+"..." if ak else None,
+        "openai_key_set": bool(ok),
+        "openai_key_prefix": ok[:15]+"..." if ok else None,
+        "env_anthropic_set": bool(env_ak),
+        "env_openai_set": bool(env_ok),
+        "agent_enabled": credentials["agent"]["enabled"],
+        "test_result": test_result,
+    }
+
+
 @app.get("/agent/status")
 async def agent_status():
     return {"enabled":credentials["agent"]["enabled"],
@@ -3343,6 +3375,27 @@ async def toggle_agent(request: Request):
     body = await request.json()
     credentials["agent"]["enabled"] = body.get("enabled",True)
     return {"enabled":credentials["agent"]["enabled"]}
+
+@app.get("/debug/ai-test")
+async def debug_ai_test():
+    """Test AI analysis with a sample order message."""
+    anthropic_key = credentials["agent"].get("anthropic_key","") or os.getenv("ANTHROPIC_API_KEY","")
+    openai_key    = credentials["agent"].get("openai_key","") or os.getenv("OPENAI_API_KEY","") or os.getenv("OPENAI_API_KEY","") or os.getenv("OPENAI_API_KEY","") or os.getenv("OPENAI_API_KEY","")
+    result = await analyze_with_ai(
+        text="I want 5kg chicken and 3kg beef",
+        sender="Test User",
+        customer="iSTEAKS",
+        history=[]
+    )
+    return {
+        "has_anthropic_key": bool(anthropic_key),
+        "has_openai_key": bool(openai_key),
+        "anthropic_key_prefix": anthropic_key[:12]+"..." if anthropic_key else "NONE",
+        "openai_key_prefix": openai_key[:12]+"..." if openai_key else "NONE",
+        "credentials_agent_keys": list(credentials["agent"].keys()),
+        "result": result,
+    }
+
 
 @app.post("/agent/test")
 async def test_agent(request: Request):
