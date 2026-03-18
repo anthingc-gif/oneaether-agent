@@ -1141,6 +1141,9 @@ function ProductsScreen({ conn = {} }) {
   const [search, setSearch]       = useState("");
   const [syncing, setSyncing]     = useState(false);
   const [lastSync, setLastSync]   = useState("");
+  const [showAdd, setShowAdd]     = useState(false);
+  const [newProd, setNewProd]     = useState({name:"",sku:"",uom:"unit",uom_id:"",price:"",tax_rate:"9",item_id:""});
+  const [adding, setAdding]       = useState(false);
   const PER_PAGE = 40;
   const agentUrl = conn.agentUrl || window.AGENT_URL || "https://oneaether-agent-production.up.railway.app";
 
@@ -1150,29 +1153,38 @@ function ProductsScreen({ conn = {} }) {
       const d = await res.json();
       setProducts(d.products || []);
       setTotal(d.total || 0);
-    } catch(e) { console.warn("fetch products:", e); }
+    } catch(e) { console.warn(e); }
   };
 
-  const syncProducts = async () => {
+  const syncFromOrders = async () => {
     if (syncing) return;
     setSyncing(true);
     try {
-      const res = await fetch(`${agentUrl}/sync/products`, { method: "POST" });
-      const text = await res.text();
-      let d = {};
-      try { d = JSON.parse(text); } catch(e) {}
-      if (d.status === "error") {
-        alert("Sync error: " + (d.error || "unknown"));
-      } else {
-        setLastSync(`${new Date().toLocaleTimeString()} (${d.synced || 0} products)`);
-        setPage(1);
+      const res = await fetch(`${agentUrl}/sync/products-from-orders`, { method: "POST" });
+      const d = await res.json();
+      if (d.error) { alert("Error: " + d.error); return; }
+      setLastSync(`${new Date().toLocaleTimeString()} (${d.products_saved || 0} products from ${d.orders_scanned || 0} orders)`);
+      await fetchProducts(1, "");
+    } catch(e) { alert("Failed: " + e.message); }
+    finally { setSyncing(false); }
+  };
+
+  const addProduct = async () => {
+    if (!newProd.name || !newProd.sku) { alert("Name and SKU required"); return; }
+    setAdding(true);
+    try {
+      const res = await fetch(`${agentUrl}/products/manual`, {
+        method: "POST", headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({...newProd, price: parseFloat(newProd.price)||0, tax_rate: parseFloat(newProd.tax_rate)||9, item_id: newProd.item_id || newProd.sku}),
+      });
+      const d = await res.json();
+      if (d.status === "ok") {
+        setShowAdd(false);
+        setNewProd({name:"",sku:"",uom:"unit",uom_id:"",price:"",tax_rate:"9",item_id:""});
         await fetchProducts(1, "");
       }
-    } catch(e) {
-      alert("Sync failed: " + e.message);
-    } finally {
-      setSyncing(false);
-    }
+    } catch(e) { alert("Failed: " + e.message); }
+    finally { setAdding(false); }
   };
 
   useEffect(() => { fetchProducts(1, ""); }, []);
@@ -1181,33 +1193,64 @@ function ProductsScreen({ conn = {} }) {
 
   return (
     <div>
-      <div style={{display:"flex",gap:8,marginBottom:16,alignItems:"center"}}>
+      <div style={{display:"flex",gap:8,marginBottom:12,alignItems:"center",flexWrap:"wrap"}}>
         <input className="form-input" placeholder="Search products..." value={search}
-          style={{flex:1}} onChange={e=>setSearch(e.target.value)}
+          style={{flex:1,minWidth:160}} onChange={e=>setSearch(e.target.value)}
           onKeyDown={e=>{ if(e.key==="Enter"){setPage(1);fetchProducts(1,search);} }} />
-        <button className="btn btn-ghost btn-sm" onClick={()=>{setPage(1);fetchProducts(1,search);}}>🔍 Search</button>
-        <button className="btn btn-primary btn-sm" onClick={syncProducts} disabled={syncing}>
-          {syncing ? "⏳ Syncing..." : "↻ Sync Products"}
+        <button className="btn btn-ghost btn-sm" onClick={()=>{setPage(1);fetchProducts(1,search);}}>🔍</button>
+        <button className="btn btn-primary btn-sm" onClick={syncFromOrders} disabled={syncing}>
+          {syncing ? "⏳ Syncing..." : "↻ Sync from Orders"}
         </button>
-        {lastSync && <span style={{fontSize:11,color:"var(--text2)"}}>Last sync: {lastSync}</span>}
+        <button className="btn btn-ghost btn-sm" onClick={()=>setShowAdd(!showAdd)}>+ Add Product</button>
+        {lastSync && <span style={{fontSize:11,color:"var(--text2)"}}>Last: {lastSync}</span>}
       </div>
+
+      {/* Note about B2B products */}
+      <div style={{background:"#f59e0b12",border:"1px solid #f59e0b30",borderRadius:8,
+        padding:"8px 14px",marginBottom:12,fontSize:12,color:"#f59e0b"}}>
+        ⚠️ SNC products API requires B2B to be enabled per product. Use <strong>↻ Sync from Orders</strong> to extract products from past orders, or <strong>+ Add Product</strong> to add manually. To enable full sync, go to SellnChill → Products → enable B2B for each product.
+      </div>
+
+      {/* Add product form */}
+      {showAdd && (
+        <div style={{background:"var(--card)",borderRadius:"var(--r2)",padding:16,marginBottom:16}}>
+          <div style={{fontWeight:700,fontSize:13,marginBottom:12}}>Add Product Manually</div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:8}}>
+            {[["Name*","name","text"],["SKU*","sku","text"],["Item ID (SNC)","item_id","text"],
+              ["UOM","uom","text"],["UOM ID (SNC)","uom_id","text"],["Price","price","number"],
+              ["Tax Rate %","tax_rate","number"]].map(([lbl,key,type])=>(
+              <div key={key}>
+                <div style={{fontSize:11,color:"var(--text2)",marginBottom:4}}>{lbl}</div>
+                <input className="form-input" type={type} value={newProd[key]}
+                  onChange={e=>setNewProd(p=>({...p,[key]:e.target.value}))} />
+              </div>
+            ))}
+          </div>
+          <div style={{display:"flex",gap:8}}>
+            <button className="btn btn-primary btn-sm" onClick={addProduct} disabled={adding}>
+              {adding ? "Saving..." : "Save Product"}
+            </button>
+            <button className="btn btn-ghost btn-sm" onClick={()=>setShowAdd(false)}>Cancel</button>
+          </div>
+        </div>
+      )}
 
       {products.length === 0 && !syncing && (
         <div style={{textAlign:"center",padding:40}}>
           <div style={{fontSize:40,marginBottom:12}}>📦</div>
           <div style={{fontWeight:600,color:"var(--text)",marginBottom:6}}>No products yet</div>
-          <div style={{fontSize:13,color:"var(--text2)",marginBottom:16}}>Click ↻ Sync Products to pull from SellnChill ERP</div>
-          <button className="btn btn-primary" onClick={syncProducts}>↻ Sync Products</button>
+          <div style={{fontSize:13,color:"var(--text2)",marginBottom:16}}>Click ↻ Sync from Orders to extract products from your past B2B orders</div>
+          <button className="btn btn-primary" onClick={syncFromOrders} disabled={syncing}>↻ Sync from Orders</button>
         </div>
       )}
 
       {products.length > 0 && (
         <>
           <div style={{fontSize:12,color:"var(--text2)",marginBottom:10}}>
-            Showing {products.length} of {total} products
+            {total} products · Click a row to edit
           </div>
-          <div style={{background:"var(--card)",borderRadius:"var(--r2)",overflow:"hidden"}}>
-            <table style={{width:"100%",borderCollapse:"collapse"}}>
+          <div style={{background:"var(--card)",borderRadius:"var(--r2)",overflow:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse",minWidth:600}}>
               <thead>
                 <tr style={{background:"var(--bg)"}}>
                   {["Product Name","SKU","UOM","Price","Tax","Status"].map(h=>(
