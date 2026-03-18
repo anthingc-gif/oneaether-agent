@@ -783,12 +783,34 @@ def detect_intent(text: str) -> Tuple[str, float]:
     return best, min(scores[best] / 3.0, 1.0)
 
 def extract_items(text: str) -> List[Dict]:
+    """Extract order items from text. Handles qty+uom+name and name+qty+uom formats."""
     items = []
-    pattern = r'(\d+)\s*(boxes?|pcs?|packets?|pkts?|kgs?|units?|bags?|cans?|bottles?)?\s+(?:of\s+)?([a-zA-Z][a-zA-Z\s]{2,30}?)(?=\s+and\b|\s*,|\s*$)'
-    for m in re.finditer(pattern, text, re.IGNORECASE):
+    seen: set = set()
+    text = text.replace("\r", "").replace("\n", ", ")
+    UOM = r"(?:kg|kgs|grams?|g|pcs?|pkt|pkts?|packets?|boxes?|bags?|units?|cans?|bottles?|cartons?|nos?)"
+    # Pattern A: qty [uom] name  →  "5kg chicken", "3 boxes beef"
+    pA = re.compile(
+        r"(\d+(?:\.\d+)?)\s*(" + UOM + r")?\s+(?:of\s+)?([a-zA-Z][a-zA-Z0-9\s\-]{1,40}?)"
+        r"(?=\s*(?:,|\band\b|&|$))", re.IGNORECASE)
+    # Pattern B: name qty uom  →  "chicken 5kg", "beef cubes 3pcs"
+    pB = re.compile(
+        r"([a-zA-Z][a-zA-Z0-9\s\-]{1,40}?)\s+(\d+(?:\.\d+)?)\s*(" + UOM + r")"
+        r"(?=\s*(?:,|\band\b|&|$))", re.IGNORECASE)
+    for m in pA.finditer(text):
         qty, uom, name = m.groups()
-        name = name.strip().rstrip('.,')
-        if name: items.append({"name": name, "qty": int(qty), "uom": uom or "unit"})
+        name = name.strip().rstrip(".,- ")
+        key = name.lower()
+        if len(name) > 1 and key not in seen:
+            seen.add(key)
+            items.append({"name": name, "qty": float(qty), "uom": (uom or "unit").lower()})
+    if not items:
+        for m in pB.finditer(text):
+            name, qty, uom = m.groups()
+            name = name.strip().rstrip(".,- ")
+            key = name.lower()
+            if len(name) > 1 and key not in seen:
+                seen.add(key)
+                items.append({"name": name, "qty": float(qty), "uom": (uom or "unit").lower()})
     return items
 
 def extract_order_number(text: str) -> Optional[str]:
@@ -1171,8 +1193,13 @@ async def process_incoming_message(message: Dict, contact: Dict, company_id: str
     logger.info("[AGENT] %s | %s | %.0f%%", intent, sender, analysis.get("confidence",0)*100)
 
     # For new orders, enrich with product lookup
-    if intent == "NEW_ORDER" and analysis.get("items"):
-        enriched = await lookup_products_for_items(analysis["items"])
+    # Also try rule-based extraction if AI found no items
+    if intent == "NEW_ORDER":
+        ai_items = analysis.get("items",[])
+        if not ai_items:
+            ai_items = extract_items(text)
+            analysis["items"] = ai_items
+        enriched = await lookup_products_for_items(ai_items) if ai_items else []
         found    = [i for i in enriched if i.get("found")]
         missing  = [i for i in enriched if not i.get("found")]
         if found:
