@@ -819,22 +819,33 @@ def extract_order_number(text: str) -> Optional[str]:
 
 # ─── AI Analysis ──────────────────────────────────────────────────────────────
 async def analyze_with_ai(text: str, sender: str, customer: Optional[str], history: List[Dict]) -> Dict:
-    anthropic_key = credentials["agent"].get("anthropic_key","")
-    openai_key    = credentials["agent"].get("openai_key","")
+    anthropic_key = credentials["agent"].get("anthropic_key","") or os.getenv("ANTHROPIC_API_KEY","")
+    openai_key    = credentials["agent"].get("openai_key","") or os.getenv("OPENAI_API_KEY","") or os.getenv("OPENAI_API_KEY","")
     intent, confidence = detect_intent(text)
     base = {"intent": intent, "confidence": confidence, "items": extract_items(text),
             "order_number": extract_order_number(text), "reply": None, "method": "rule-based"}
-    if not anthropic_key and not openai_key: return base
+    if not anthropic_key and not openai_key:
+        logger.warning("No AI key set — using rule-based detection. Set Anthropic key in Settings.")
+        return base
 
     ctx = "\n".join([f"{m['role'].upper()}: {m['text']}" for m in history[-4:]]) if history else "None"
     system = """You are a WhatsApp ordering assistant for a B2B food distribution company.
-Return ONLY valid JSON — no markdown.
-Intent: NEW_ORDER, AMEND_ORDER, CANCEL_ORDER, ORDER_STATUS, ENQUIRY, GREETING, UNKNOWN
+Return ONLY valid JSON — no markdown, no extra text.
+Intent options: NEW_ORDER, AMEND_ORDER, CANCEL_ORDER, ORDER_STATUS, ENQUIRY, GREETING, UNKNOWN
+
+IMPORTANT: Extract ALL items from the message. Messages may have multiple items separated by commas, "and", or newlines.
+Example: "5kg chicken and 3kg beef" → 2 items. "chicken 5kg, pork 2kg, fish 3pcs" → 3 items.
+
+Response format:
 {
-  "intent": "NEW_ORDER", "confidence": 0.95,
-  "items": [{"name": "chicken", "qty": 5, "uom": "unit"}],
+  "intent": "NEW_ORDER",
+  "confidence": 0.95,
+  "items": [
+    {"name": "chicken curry cut", "qty": 5, "uom": "kg"},
+    {"name": "beef cubes", "qty": 3, "uom": "kg"}
+  ],
   "order_number": null,
-  "reply": "friendly reply confirming what you understood"
+  "reply": "Got it! I have: chicken curry cut 5kg, beef cubes 3kg. Reply CONFIRM to place order."
 }"""
     user = f"Sender: {sender}\nCustomer: {customer or 'Unknown'}\nHistory:\n{ctx}\nMessage: \"{text}\""
 
@@ -1138,6 +1149,58 @@ async def push_order_to_snc(items: List[Dict], chat_id: str, delivery_date: str,
     return order_num
 
 
+def build_reply(analysis: Dict, sender: str) -> str:
+    """Generate a reply based on intent analysis."""
+    intent = analysis.get("intent","UNKNOWN")
+    items  = analysis.get("items",[])
+    order_number = analysis.get("order_number")
+
+    if analysis.get("reply"):
+        return analysis["reply"]
+
+    if intent == "GREETING":
+        return f"Hi {sender}! 👋 How can I help you today? You can place an order by telling me what you need."
+
+    if intent == "NEW_ORDER":
+        if items:
+            lines = "\n".join([f"  • {i.get('name','?')} × {i.get('qty',1)} {i.get('uom','unit')}" for i in items])
+            return f"Got it {sender}! 🛒\n\n{lines}\n\nReply *CONFIRM* to place this order, or let me know your delivery date."
+        return f"Sure {sender}! What would you like to order? Please include product name and quantity."
+
+    if intent == "ORDER_STATUS":
+        if order_number:
+            return f"Let me check order *{order_number}* for you. Please wait a moment."
+        return f"Could you share your order number? It looks like WA-DDMMYYYY-001."
+
+    if intent == "AMEND_ORDER":
+        return f"I'll help you amend your order. What changes would you like to make?"
+
+    if intent == "CANCEL_ORDER":
+        return f"I'll process your cancellation request. Could you confirm the order number?"
+
+    if intent == "ENQUIRY":
+        return f"Happy to help with your enquiry {sender}! What would you like to know?"
+
+    return f"Thanks {sender}! How can I help you today?"
+
+
+def build_reply(analysis: Dict, sender: str) -> str:
+    """Build a reply message based on intent analysis."""
+    intent = analysis.get("intent","UNKNOWN")
+    ai_reply = analysis.get("reply","")
+    if ai_reply:
+        return ai_reply
+    replies = {
+        "GREETING":     f"Hi {sender}! 👋 How can I help you today? You can send me your order and I'll process it right away.",
+        "ORDER_STATUS": f"Let me check your order status. Please provide your order number (e.g. B2B-DDMMYYYY-001).",
+        "AMEND_ORDER":  f"Sure {sender}, I can help amend your order. Please share the order number and what changes you'd like.",
+        "CANCEL_ORDER": f"I'll help you cancel the order. Please provide the order number to proceed.",
+        "ENQUIRY":      f"Happy to help with your enquiry! What would you like to know?",
+        "UNKNOWN":      f"Hi {sender}! I'm your ordering assistant. Send me your order (e.g. '5kg chicken, 3kg beef') and I'll process it for you.",
+    }
+    return replies.get(intent, replies["UNKNOWN"])
+
+
 async def process_incoming_message(message: Dict, contact: Dict, company_id: str, chat_id: str):
     if not credentials["agent"]["enabled"]: return
     text = ""
@@ -1196,9 +1259,16 @@ async def process_incoming_message(message: Dict, contact: Dict, company_id: str
     # Also try rule-based extraction if AI found no items
     if intent == "NEW_ORDER":
         ai_items = analysis.get("items",[])
+        # Always try rule-based extraction to supplement AI results
         if not ai_items:
             ai_items = extract_items(text)
             analysis["items"] = ai_items
+        elif len(ai_items) == 1:
+            # AI may have missed items — check rule-based too
+            rule_items = extract_items(text)
+            if len(rule_items) > len(ai_items):
+                ai_items = rule_items
+                analysis["items"] = ai_items
         enriched = await lookup_products_for_items(ai_items) if ai_items else []
         found    = [i for i in enriched if i.get("found")]
         missing  = [i for i in enriched if not i.get("found")]
