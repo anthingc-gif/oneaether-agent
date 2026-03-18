@@ -1041,6 +1041,9 @@ async def push_order_to_snc(items: List[Dict], chat_id: str, delivery_date: str,
     currency_val = b2b.get("currency","SGD")
     if isinstance(currency_val, dict): currency_val = currency_val.get("currency","SGD")
 
+    # Generate temp order number — SNC will assign the real one
+    order_number = f"WA-{datetime.now().strftime('%d%m%Y-%H%M%S')}"
+
     order_payload = {
         "company_id": company_id, "source": "B2B", "platform": "Whatsapp",
         "invoice_number": order_number,
