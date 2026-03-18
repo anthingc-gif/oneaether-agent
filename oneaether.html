@@ -2034,7 +2034,7 @@ function WhatsAppScreen({ conn = {} }) {
               {cur.messages.map(m=>(
                 <div key={m.id} className={`wa-msg-row ${m.from}`}>
                   <div className={`wa-bubble ${m.from}`}>
-                    <div>{m.text}</div>
+                    <div style={{whiteSpace:"pre-wrap",wordBreak:"break-word"}}>{m.text}</div>
                     {m.intent&&<IntentTag intent={m.intent}/>}
                     <div className="wa-bubble-time">{m.time}</div>
                   </div>
